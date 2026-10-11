@@ -72,13 +72,14 @@ add_library(recordion_core STATIC
     src/output/AsyncFileWriter.cpp
     src/output/ClipSaver.cpp
     src/pipeline/CaptureSession.cpp
+    src/audio/AacEncoder.cpp
 )
 target_sources(recordion_core PRIVATE ${SHADER_HEADERS})
 target_include_directories(recordion_core PUBLIC src PRIVATE ${SHADER_OUT})
 target_link_libraries(recordion_core
     PUBLIC recordion_options WIL::WIL amf_headers nvenc_headers
     PRIVATE nlohmann_json::nlohmann_json
-    PUBLIC d3d11 dxgi avrt shell32 ole32 windowsapp)
+    PUBLIC d3d11 dxgi avrt shell32 ole32 windowsapp mfplat mfuuid wmcodecdspuuid)
 
 add_executable(recordion WIN32
     src/app/main.cpp
@@ -102,6 +103,7 @@ add_executable(recordion_tests
     tests/test_naming.cpp
     tests/test_replay_buffer.cpp
     tests/test_file_writer.cpp
+    tests/test_audio.cpp
 )
 target_link_libraries(recordion_tests PRIVATE recordion_core doctest::doctest)
 target_compile_definitions(recordion_tests PRIVATE RECORDION_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data")
