@@ -1,0 +1,11 @@
+/build/
+/out/
+/vcpkg_installed/
+/.vs/
+/.vscode/
+CMakeUserPresets.json
+*.user
+*.pgd
+*.pgc
+*.mp4
+*.log

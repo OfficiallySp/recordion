@@ -1,0 +1,5 @@
+* text=auto
+
+# Bitstream fixtures and the icon are compared byte for byte; never convert line endings.
+tests/data/** binary
+*.ico binary

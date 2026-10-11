@@ -1,0 +1,1 @@
+AMF SDK headers from https://github.com/GPUOpen-LibrariesAndSDKs/AMF commit 8c648005e07d4309033282bfd9947df2c7e76104 (Tue Sep 29 00:52:11 2026 -0400)
