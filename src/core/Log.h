@@ -8,9 +8,9 @@ namespace rec::log {
 
 enum class Level { Debug, Info, Warn, Error };
 
-// Opens <dir>/recordion.log (rotated to recordion.old.log past 4 MB). Safe to skip in tests:
-// without init() messages only go to the debugger.
-void init(const std::filesystem::path& dir, Level minLevel);
+// Opens <dir>/<name>.log (rotated to <name>.old.log past 4 MB). Safe to skip in tests: without
+// init() messages only go to the debugger.
+void init(const std::filesystem::path& dir, Level minLevel, const std::wstring& name = L"recordion");
 void shutdown();
 void write(Level level, std::string_view message);
 

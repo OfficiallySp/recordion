@@ -11,7 +11,11 @@
 namespace rec {
 namespace {
 
-constexpr int64_t kWaitForEncoder100ns = 1'500'000; // 150 ms for in-flight frames to come out
+// In-flight video frames take a frame or two to come out of the encoder; audio is mixed ~100 ms
+// behind real time.
+constexpr int64_t kWaitForEncoders100ns = 4'000'000;
+// Two AAC frames before the first video frame: the decoder needs one to warm up.
+constexpr int64_t kAudioPreroll100ns = 2 * 1024 * 10'000'000LL / 48000;
 
 FILETIME addTicks(FILETIME t, int64_t ticks) {
     ULARGE_INTEGER u{.LowPart = t.dwLowDateTime, .HighPart = t.dwHighDateTime};
@@ -79,10 +83,18 @@ SaveResult ClipSaver::save(const SaveJob& job) {
     SaveResult r;
     r.game = job.game;
     // Frames captured just before the hotkey are still in the encoder: give them a moment.
-    const int64_t deadline = clock::now100ns() + kWaitForEncoder100ns;
-    while (job.buffer->newestPts(kVideoTrack) < job.to100ns && clock::now100ns() < deadline) Sleep(5);
+    const int64_t deadline = clock::now100ns() + kWaitForEncoders100ns;
+    const auto info = job.buffer->segmentInfo(job.buffer->stats().newestSegment);
+    const size_t audioTracks = info ? info->audio.size() : 0;
+    auto caughtUp = [&] {
+        if (job.buffer->newestPts(kVideoTrack) < job.to100ns) return false;
+        for (size_t t = 1; t <= audioTracks; ++t)
+            if (job.buffer->newestPts(static_cast<uint8_t>(t)) < job.to100ns) return false;
+        return true;
+    };
+    while (!caughtUp() && clock::now100ns() < deadline) Sleep(5);
 
-    const auto snap = job.buffer->snapshot(job.from100ns, job.to100ns);
+    const auto snap = job.buffer->snapshot(job.from100ns, job.to100ns, 0, kAudioPreroll100ns);
     if (!snap || !snap->info) {
         r.error = "Nothing has been recorded yet";
         return r;
@@ -90,8 +102,12 @@ SaveResult ClipSaver::save(const SaveJob& job) {
 
     Mp4ClipInput clip;
     clip.video = snap->info->video;
-    for (const auto& p : snap->packets)
+    clip.audio.resize(snap->info->audio.size());
+    for (size_t t = 0; t < clip.audio.size(); ++t) clip.audio[t].track = snap->info->audio[t];
+    for (const auto& p : snap->packets) {
         if (p.track == kVideoTrack) clip.videoSamples.push_back({snap->bytes(p), p.pts, p.keyframe});
+        else if (p.track <= clip.audio.size()) clip.audio[p.track - 1].samples.push_back({snap->bytes(p), p.pts, true});
+    }
     if (clip.videoSamples.empty()) {
         r.error = "Nothing has been recorded yet";
         return r;

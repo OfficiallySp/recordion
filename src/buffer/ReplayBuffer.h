@@ -77,8 +77,10 @@ public:
     void append(uint8_t track, int64_t pts, bool keyframe, uint32_t segment, std::span<const uint8_t> data);
 
     // Packets of `segment` (the newest one if 0) from the last video keyframe at or before `from`
-    // (or the oldest keyframe held) through `to`. nullptr if there is no keyframe in range.
-    std::shared_ptr<Snapshot> snapshot(int64_t from100ns, int64_t to100ns, uint32_t segment = 0);
+    // (or the oldest keyframe held) through `to`. Audio starts up to `audioPreroll100ns` before the
+    // keyframe, so the first audible frame decodes completely. nullptr if no keyframe is in range.
+    std::shared_ptr<Snapshot> snapshot(int64_t from100ns, int64_t to100ns, uint32_t segment = 0,
+                                       int64_t audioPreroll100ns = 0);
 
     void setSegmentInfo(uint32_t segment, std::shared_ptr<const SegmentInfo> info);
     std::shared_ptr<const SegmentInfo> segmentInfo(uint32_t segment) const;

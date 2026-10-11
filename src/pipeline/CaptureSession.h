@@ -1,5 +1,6 @@
 #pragma once
 
+#include "audio/AudioPipeline.h"
 #include "buffer/ReplayBuffer.h"
 #include "capture/ICaptureSource.h"
 #include "core/Settings.h"
@@ -24,6 +25,7 @@ class ClipSaver;
 struct SessionConfig {
     CaptureTarget target;
     std::string name = "Desktop"; // game name; used for the output folder and file names
+    DWORD processId = 0;          // the game's process (game-only audio); 0 for the desktop
     Settings settings;            // snapshot taken when the session starts
     bool synthetic = false;       // render test frames instead of capturing (benchmarks/tests)
     HWND notifyWindow = nullptr;  // receives notifyMessage with wParam = kSessionFailed / kSessionEnded
@@ -40,6 +42,7 @@ struct SessionStats {
     uint64_t droppedBusy = 0;
     uint64_t encodeErrors = 0;
     bool zeroCopy = false;
+    size_t audioTracks = 0;
     Size outputSize{};
     ReplayBuffer::Stats buffer;
 };
@@ -75,6 +78,9 @@ private:
 
     SessionConfig config_;
     std::shared_ptr<ReplayBuffer> buffer_;
+    AudioPipeline audio_;
+    std::vector<Mp4AudioTrack> audioTracks_;
+    std::atomic<uint32_t> currentSegment_{0}; // read by the audio thread
     std::thread thread_;
     wil::unique_event_nothrow stopEvent_;
     wil::unique_event_nothrow startedEvent_;

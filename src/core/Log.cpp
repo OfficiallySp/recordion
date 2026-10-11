@@ -28,14 +28,14 @@ const char* levelName(Level l) {
 
 } // namespace
 
-void init(const std::filesystem::path& dir, Level minLevel) {
+void init(const std::filesystem::path& dir, Level minLevel, const std::wstring& name) {
     std::scoped_lock lock(g_mutex);
     g_minLevel = minLevel;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    const auto path = dir / L"recordion.log";
+    const auto path = dir / (name + L".log");
     if (std::filesystem::file_size(path, ec) > kMaxLogBytes && !ec)
-        std::filesystem::rename(path, dir / L"recordion.old.log", ec);
+        std::filesystem::rename(path, dir / (name + L".old.log"), ec);
     g_file = _wfsopen(path.c_str(), L"ab", _SH_DENYWR);
 }
 

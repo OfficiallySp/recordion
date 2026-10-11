@@ -7,6 +7,7 @@
 #include "core/Log.h"
 #include "core/Paths.h"
 #include "core/ThreadQos.h"
+#include "core/Utf.h"
 #include "encode/AmfEncoder.h"
 #include "mux/Bitstream.h"
 #include "output/ClipSaver.h"
@@ -26,8 +27,9 @@ const char* codecName(Codec c) { return c == Codec::H264 ? "H.264" : c == Codec:
 // Turns encoder output into sample-format packets in the replay buffer.
 class CaptureSession::BufferSink final : public PacketSink {
 public:
-    BufferSink(ReplayBuffer& buffer, Codec codec, uint32_t segment, uint32_t fps, std::atomic<uint64_t>& encoded)
-        : buffer_(buffer), codec_(codec), segment_(segment), fps_(fps), encoded_(encoded) {
+    BufferSink(ReplayBuffer& buffer, Codec codec, uint32_t segment, uint32_t fps, std::vector<Mp4AudioTrack> audio,
+               std::atomic<uint64_t>& encoded)
+        : buffer_(buffer), codec_(codec), segment_(segment), fps_(fps), audio_(std::move(audio)), encoded_(encoded) {
         scratch_.reserve(1 << 20);
     }
 
@@ -42,6 +44,7 @@ public:
             auto segment = std::make_shared<SegmentInfo>();
             // The bitstream's own size: e.g. AMD RDNA3 AV1 codes 1080p as 1082 lines.
             segment->video = {codec_, info->width, info->height, fps_, 1, info->configRecord};
+            segment->audio = audio_;
             buffer_.setSegmentInfo(segment_, std::move(segment));
             configured_ = true;
         }
@@ -56,6 +59,7 @@ private:
     Codec codec_;
     uint32_t segment_;
     uint32_t fps_;
+    std::vector<Mp4AudioTrack> audio_;
     std::atomic<uint64_t>& encoded_;
     bool configured_ = false;
     std::vector<uint8_t> scratch_;
@@ -80,6 +84,26 @@ bool CaptureSession::start() {
     o.diskDirectory = paths::logDir().parent_path() / L"buffer";
     if (!buffer_->init(o)) return false;
 
+    // Audio first: its tracks are part of every segment's description.
+    AudioConfig ac;
+    ac.captureSystem = s.audio.captureSystem;
+    ac.gamePid = config_.processId;
+    ac.gameAudioOnly = s.audio.gameAudioOnly;
+    ac.captureMic = s.audio.captureMic;
+    ac.micDeviceId = widen(s.audio.micDeviceId);
+    ac.separateTracks = s.audio.separateTracks;
+    ac.kbps = s.audio.bitrateKbps;
+    ac.gameLabel = config_.processId ? "Game" : "Desktop";
+    audioTracks_.clear();
+    if ((ac.captureSystem || ac.captureMic) &&
+        audio_.start(ac, [this](uint8_t track, int64_t pts, std::span<const uint8_t> frame) {
+            buffer_->append(track, pts, true, currentSegment_.load(std::memory_order_relaxed), frame);
+        })) {
+        audioTracks_ = audio_.tracks();
+    } else if (ac.captureSystem || ac.captureMic) {
+        log::warn("session: no audio device available; recording video only");
+    }
+
     stopEvent_.ResetEvent();
     startedEvent_.ResetEvent();
     thread_ = std::thread([this] { run(); });
@@ -91,6 +115,7 @@ bool CaptureSession::start() {
 void CaptureSession::stop() {
     stopEvent_.SetEvent();
     if (thread_.joinable()) thread_.join();
+    audio_.stop();
     running_ = false;
 }
 
@@ -173,7 +198,8 @@ bool CaptureSession::configureEncoder(Size captureSize, Size textureSize) {
     }
 
     ++segment_;
-    sink_ = std::make_unique<BufferSink>(*buffer_, s.video.codec, segment_, s.video.fps, framesEncoded_);
+    currentSegment_ = segment_;
+    sink_ = std::make_unique<BufferSink>(*buffer_, s.video.codec, segment_, s.video.fps, audioTracks_, framesEncoded_);
     captureSize_ = captureSize;
     forceKeyframe_ = true;
     statsZeroCopy_ = zeroCopy_;
@@ -293,6 +319,7 @@ SessionStats CaptureSession::stats() const {
     s.droppedBusy = droppedBusy_.load(std::memory_order_relaxed);
     s.encodeErrors = encodeErrors_.load(std::memory_order_relaxed);
     s.zeroCopy = statsZeroCopy_.load(std::memory_order_relaxed);
+    s.audioTracks = audioTracks_.size();
     s.outputSize = {statsWidth_.load(std::memory_order_relaxed), statsHeight_.load(std::memory_order_relaxed)};
     s.buffer = buffer_->stats();
     return s;

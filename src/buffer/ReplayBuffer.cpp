@@ -127,7 +127,8 @@ void ReplayBuffer::append(uint8_t track, int64_t pts, bool keyframe, uint32_t se
     newestSegment_ = std::max(newestSegment_, segment);
 }
 
-std::shared_ptr<ReplayBuffer::Snapshot> ReplayBuffer::snapshot(int64_t from, int64_t to, uint32_t segment) {
+std::shared_ptr<ReplayBuffer::Snapshot> ReplayBuffer::snapshot(int64_t from, int64_t to, uint32_t segment,
+                                                               int64_t audioPreroll) {
     std::scoped_lock lock(mutex_);
     if (packets_.empty()) return nullptr;
     if (segment == 0) segment = newestSegment_;
@@ -150,8 +151,10 @@ std::shared_ptr<ReplayBuffer::Snapshot> ReplayBuffer::snapshot(int64_t from, int
     // Audio and video arrive with different latencies, so audio from after the keyframe can sit
     // earlier in the arena: select by timestamp, then pin from the first selected byte.
     const int64_t startPts = start->pts;
-    for (const auto& p : packets_)
-        if (p.segment == segment && p.pts >= startPts && p.pts <= to) snap->packets.push_back(p);
+    for (const auto& p : packets_) {
+        const int64_t first = p.track == kVideoTrack ? startPts : startPts - audioPreroll;
+        if (p.segment == segment && p.pts >= first && p.pts <= to) snap->packets.push_back(p);
+    }
     snap->pinFrom_ = snap->packets.front().offset; // packets_ is in offset order
     pins_.push_back(snap.get());
     return snap;

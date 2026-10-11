@@ -47,7 +47,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     if (!args.empty() && args[0] == L"--bench") {
         attachParentConsole();
-        rec::log::init(rec::paths::logDir(), logLevel);
+        // Its own file: the tray app keeps recordion.log open while it runs.
+        rec::log::init(rec::paths::logDir(), logLevel, L"recordion-bench");
         const int rc = rec::runBench(args);
         rec::log::shutdown();
         fflush(stdout);

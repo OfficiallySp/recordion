@@ -50,6 +50,7 @@ struct BenchOptions {
     bool forceVideoProcessor = false;
     uint32_t replaySeconds = 5;
     std::wstring outDir;
+    DWORD pid = 0; // session mode: capture only this process's audio
 };
 
 void usage() {
@@ -81,6 +82,7 @@ bool parse(const std::vector<std::wstring>& args, BenchOptions& o) {
         else if (a == L"--dump-frame") o.dumpFrame = *v;
         else if (a == L"--replay") o.replaySeconds = static_cast<uint32_t>(std::stoul(*v));
         else if (a == L"--out-dir") o.outDir = *v;
+        else if (a == L"--pid") o.pid = static_cast<DWORD>(std::stoul(*v));
         else if (a == L"--synthetic-size") {
             const auto x = v->find(L'x');
             if (x == std::wstring::npos) return false;
@@ -260,6 +262,7 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
     cfg.target.monitor = monitor;
     cfg.name = o.synthetic.width ? "Synthetic Test" : "Desktop";
     cfg.synthetic = o.synthetic.width != 0;
+    cfg.processId = o.pid;
     cfg.settings.video.codec = o.codec.value_or(Codec::HEVC);
     cfg.settings.video.tenBit = o.tenBit;
     cfg.settings.video.fps = o.fps;

@@ -73,13 +73,15 @@ add_library(recordion_core STATIC
     src/output/ClipSaver.cpp
     src/pipeline/CaptureSession.cpp
     src/audio/AacEncoder.cpp
+    src/audio/WasapiSource.cpp
+    src/audio/AudioPipeline.cpp
 )
 target_sources(recordion_core PRIVATE ${SHADER_HEADERS})
 target_include_directories(recordion_core PUBLIC src PRIVATE ${SHADER_OUT})
 target_link_libraries(recordion_core
     PUBLIC recordion_options WIL::WIL amf_headers nvenc_headers
     PRIVATE nlohmann_json::nlohmann_json
-    PUBLIC d3d11 dxgi avrt shell32 ole32 windowsapp mfplat mfuuid wmcodecdspuuid)
+    PUBLIC d3d11 dxgi avrt shell32 ole32 windowsapp mfplat mfuuid wmcodecdspuuid mmdevapi)
 
 add_executable(recordion WIN32
     src/app/main.cpp
