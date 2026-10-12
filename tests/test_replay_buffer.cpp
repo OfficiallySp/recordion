@@ -137,6 +137,22 @@ TEST_CASE("snapshots only use one encoder segment") {
     for (const auto& p : snap->packets) CHECK(p.segment == 2);
 }
 
+TEST_CASE("RAM follows what the replay window holds, not the worst-case size") {
+    ReplayBuffer b;
+    REQUIRE(b.init(options(64 << 20, 2.0))); // room for 64 MB, but keep only 2 s
+    CHECK(b.stats().committedBytes == 0);
+    // 20 s of 60 fps at 20 KB a frame (~10 Mbps): about 2.4 MB live at any time.
+    appendVideo(b, 1200, 60, 20'000);
+    const auto s = b.stats();
+    CHECK(s.capacityBytes == 64u << 20);
+    CHECK(s.committedBytes <= 6u << 20); // live data plus the chunks at either end
+    CHECK(s.committedBytes >= s.usedBytes);
+    // Data that is still held reads back intact after the arena wrapped and chunks were recycled.
+    auto snap = b.snapshot(0, INT64_MAX);
+    REQUIRE(snap);
+    for (const auto& p : snap->packets) CHECK(snap->bytes(p)[0] == static_cast<uint8_t>(p.pts / kFrame));
+}
+
 TEST_CASE("buffer sizing covers the clip, one GOP and headroom") {
     // 120 s + 2 s GOP + 1 s at 75 Mbps + 192 kbps, plus 25%
     const size_t bytes = rec::replayBufferBytes(120, 2, 75'000, 192);

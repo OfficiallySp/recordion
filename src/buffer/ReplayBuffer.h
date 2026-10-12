@@ -126,6 +126,7 @@ public:
         uint32_t newestSegment = 0;
         uint64_t droppedPackets = 0;
         uint64_t abortedSnapshots = 0;
+        size_t committedBytes = 0; // RAM actually backing the buffer right now
     };
     Stats stats() const;
     int64_t newestPts(uint8_t track) const;
@@ -135,6 +136,8 @@ private:
     bool evictFor(uint64_t newEnd, int64_t newestPts); // false if pinned data is in the way
     uint8_t* physical(uint64_t logical) const { return arena_ + (logical % capacity_); }
     void releaseArena();
+    bool commit(uint64_t offset, size_t size);
+    void decommitDead();
 
     mutable std::mutex mutex_;
     uint8_t* arena_ = nullptr;
@@ -142,6 +145,12 @@ private:
     int64_t maxDuration_ = 0;
     HANDLE file_ = nullptr;
     HANDLE mapping_ = nullptr;
+
+    // RAM mode reserves the whole arena but commits it in chunks as the write head reaches them,
+    // and decommits chunks the replay window has left behind: memory follows the real bitrate.
+    size_t chunk_ = 0;
+    std::vector<uint8_t> committed_; // per chunk
+    uint64_t deadChunks_ = 0;        // logical chunks below this have been released
 
     std::deque<BufferedPacket> packets_;
     uint64_t head_ = 0; // logical offset of the next write

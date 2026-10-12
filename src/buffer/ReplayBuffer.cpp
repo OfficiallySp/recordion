@@ -19,7 +19,9 @@ ReplayBuffer::~ReplayBuffer() { releaseArena(); }
 bool ReplayBuffer::init(const Options& o) {
     std::scoped_lock lock(mutex_);
     releaseArena();
-    capacity_ = (o.capacityBytes + 0xFFFF) & ~size_t{0xFFFF};
+    // 2 MB commit chunks for real buffers; 64 KB (the allocation granularity) for tiny ones.
+    chunk_ = o.capacityBytes >= (32u << 20) ? (2u << 20) : (64u << 10);
+    capacity_ = (o.capacityBytes + chunk_ - 1) / chunk_ * chunk_;
     maxDuration_ = o.maxDuration100ns;
 
     if (o.storage == BufferStorage::Disk) {
@@ -39,14 +41,18 @@ bool ReplayBuffer::init(const Options& o) {
         mapping_ = CreateFileMappingW(file_, nullptr, PAGE_READWRITE, size.HighPart, size.LowPart, nullptr);
         if (mapping_) arena_ = static_cast<uint8_t*>(MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, capacity_));
     } else {
-        arena_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, capacity_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        // Address space only; chunks are committed as they are written (see commit()).
+        arena_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, capacity_, MEM_RESERVE, PAGE_NOACCESS));
+        committed_.assign(capacity_ / chunk_, 0);
+        deadChunks_ = 0;
     }
     if (!arena_) {
         log::error("replay: cannot allocate {} MB buffer (error {})", capacity_ >> 20, GetLastError());
         releaseArena();
         return false;
     }
-    log::info("replay: {} MB buffer in {}", capacity_ >> 20, o.storage == BufferStorage::Disk ? "a temp file" : "RAM");
+    log::info("replay: up to {} MB in {}", capacity_ >> 20,
+              o.storage == BufferStorage::Disk ? "a temp file" : "RAM, committed as it fills");
     return true;
 }
 
@@ -64,6 +70,7 @@ void ReplayBuffer::releaseArena() {
         VirtualFree(arena_, 0, MEM_RELEASE);
     }
     arena_ = nullptr;
+    committed_.clear();
     if (file_) {
         CloseHandle(file_);
         file_ = nullptr;
@@ -118,11 +125,47 @@ void ReplayBuffer::append(uint8_t track, int64_t pts, bool keyframe, uint32_t se
         return; // the aborted saves unpin shortly; until then, drop rather than overwrite
     }
 
+    if (!commit(offset, data.size())) {
+        ++dropped_; // out of memory: lose this packet rather than crash
+        return;
+    }
     std::memcpy(physical(offset), data.data(), data.size());
     packets_.push_back({nextSeq_++, offset, static_cast<uint32_t>(data.size()), pts, segment, track, keyframe});
     head_ = offset + data.size();
+    decommitDead();
     newestPts_[track] = std::max(newestPts_[track], pts);
     newestSegment_ = std::max(newestSegment_, segment);
+}
+
+bool ReplayBuffer::commit(uint64_t offset, size_t size) {
+    if (committed_.empty()) return true; // file-backed: the memory manager handles it
+    const uint64_t chunks = committed_.size();
+    for (uint64_t c = offset / chunk_; c <= (offset + size - 1) / chunk_; ++c) {
+        const size_t i = static_cast<size_t>(c % chunks);
+        if (committed_[i]) continue;
+        if (!VirtualAlloc(arena_ + i * chunk_, chunk_, MEM_COMMIT, PAGE_READWRITE)) {
+            log::error("replay: out of memory committing the buffer");
+            return false;
+        }
+        committed_[i] = 1;
+    }
+    return true;
+}
+
+void ReplayBuffer::decommitDead() {
+    if (committed_.empty() || packets_.empty()) return;
+    // Everything before the oldest packet still held (pins keep their packets) is dead.
+    const uint64_t chunks = committed_.size();
+    const uint64_t firstLive = packets_.front().offset / chunk_;
+    const uint64_t lastLive = (head_ - 1) / chunk_;
+    for (uint64_t c = std::max(deadChunks_, firstLive > chunks ? firstLive - chunks : 0); c < firstLive; ++c) {
+        if (c + chunks <= lastLive) continue; // the same physical chunk is live again (ring wrapped onto it)
+        const size_t i = static_cast<size_t>(c % chunks);
+        if (!committed_[i]) continue;
+        VirtualFree(arena_ + i * chunk_, chunk_, MEM_DECOMMIT);
+        committed_[i] = 0;
+    }
+    deadChunks_ = std::max(deadChunks_, firstLive);
 }
 
 std::shared_ptr<ReplayBuffer::Snapshot> ReplayBuffer::snapshot(int64_t from, int64_t to, uint32_t segment,
@@ -257,6 +300,7 @@ ReplayBuffer::Stats ReplayBuffer::stats() const {
     s.newestSegment = newestSegment_;
     s.droppedPackets = dropped_;
     s.abortedSnapshots = abortedSnapshots_;
+    s.committedBytes = committed_.empty() ? capacity_ : static_cast<size_t>(std::ranges::count(committed_, 1)) * chunk_;
     return s;
 }
 

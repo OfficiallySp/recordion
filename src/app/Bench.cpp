@@ -335,8 +335,13 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
                  st.zeroCopy ? "zero-copy RGB" : "video processor");
     std::println("captured/encoded:     {} / {} ({} duplicates, {} dropped busy, {} errors)", st.framesCaptured,
                  st.framesEncoded, st.duplicates, st.droppedBusy, st.encodeErrors);
-    std::println("replay buffer:        {:.1f} / {:.1f} MB", st.buffer.usedBytes / 1048576.0,
+    std::println("replay buffer:        {:.1f} MB held, {:.1f} MB of RAM committed, {:.1f} MB reserved",
+                 st.buffer.usedBytes / 1048576.0, st.buffer.committedBytes / 1048576.0,
                  st.buffer.capacityBytes / 1048576.0);
+    PROCESS_MEMORY_COUNTERS_EX pmc{sizeof(pmc)};
+    GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+    std::println("process memory:       {:.1f} MB working set, {:.1f} MB private", pmc.WorkingSetSize / 1048576.0,
+                 pmc.PrivateUsage / 1048576.0);
     std::println("CPU (whole process):  {:.2f}% of one core", 100 * cpu / wall);
     if (recording) {
         if (recording->ok) {

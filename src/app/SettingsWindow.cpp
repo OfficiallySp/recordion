@@ -550,12 +550,18 @@ void SettingsWindow::drawReplay() {
     comboEnum("Keep the replay in", r.storage,
               {{BufferStorage::RAM, "Memory (fastest)"}, {BufferStorage::Disk, "A temporary file (for long replays)"}});
     const auto& v = draft_.video;
-    const size_t bytes = replayBufferBytes(r.seconds, v.gopSeconds, std::max(v.bitrateKbps, v.maxBitrateKbps),
-                                           draft_.audio.bitrateKbps * 3);
-    hint(std::format("Reserves about {:.0f} MB {}. Only encoded video is kept, never raw frames.", bytes / 1048576.0,
-                     r.storage == BufferStorage::RAM ? "of memory" : "in a temporary file (Windows keeps it in RAM "
-                                                                     "while memory is free)")
-             .c_str());
+    const size_t most = replayBufferBytes(r.seconds, v.gopSeconds, std::max(v.bitrateKbps, v.maxBitrateKbps),
+                                          draft_.audio.bitrateKbps * 3);
+    const double typical = (r.seconds + v.gopSeconds + 1.0) * (v.bitrateKbps + draft_.audio.bitrateKbps) * 1000 / 8;
+    if (r.storage == BufferStorage::RAM)
+        hint(std::format("Uses up to about {:.0f} MB of memory at this bitrate (never more than {:.0f} MB), and less when the "
+                         "picture is simple. Only encoded video is kept, never raw frames.",
+                         typical / 1048576.0, most / 1048576.0)
+                 .c_str());
+    else
+        hint(std::format("Uses a temporary file of up to {:.0f} MB; Windows keeps it in memory while memory is free.",
+                         most / 1048576.0)
+                 .c_str());
 }
 
 void SettingsWindow::drawAudio() {
