@@ -49,3 +49,10 @@ Hotkeys, codec, bitrate, replay length and the output folder are in
 recordion --bench --synthetic --seconds 10 --codec hevc --bitrate 20000
 recordion --bench --session --synthetic --seconds 10 --replay 5 --out-dir C:\temp\clips
 ```
+
+To measure what Recordion costs a game (average fps, 1% lows, present mode, with Recordion off and
+then on), run from an elevated terminal while the game is running:
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\measure-overhead.ps1 -Process Haste.exe
+```
