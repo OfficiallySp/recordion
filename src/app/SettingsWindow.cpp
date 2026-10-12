@@ -531,6 +531,18 @@ void SettingsWindow::drawVideo() {
                {{0, "Native (no scaling, cheapest)"}, {2160, "2160p"}, {1440, "1440p"}, {1080, "1080p"}, {720, "720p"}});
     comboValue("Keyframe every", v.gopSeconds, {{1, "1 second"}, {2, "2 seconds"}, {4, "4 seconds"}});
     hint("Native resolution lets the capture go straight into the encoder without a scaling pass.");
+
+    heading("Capture");
+    auto& c = draft_.capture;
+    if (c.method != CaptureMethod::AmdDirect) c.method = CaptureMethod::Auto;
+    comboEnum("Capture method", c.method,
+              {{CaptureMethod::Auto, "Windows Graphics Capture"}, {CaptureMethod::AmdDirect, "AMD Direct Capture (experimental)"}});
+    if (c.method == CaptureMethod::AmdDirect)
+        hint("Takes frames straight from the AMD display driver, so Windows' compositor does no work for the "
+             "recording. In games it can be slightly cheaper (measured ~0.6% vs ~1% of the 3D engine); on a still "
+             "desktop it costs more, because it copies every frame. Whole displays only, no mouse cursor. "
+             "Falls back to Windows Graphics Capture on other GPUs.");
+    ImGui::Checkbox("Include the mouse cursor", &c.captureCursor);
 }
 
 void SettingsWindow::drawReplay() {

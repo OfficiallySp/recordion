@@ -10,6 +10,9 @@
 #include "app/SettingsWindow.h"
 #include "detect/GameLibrary.h"
 #include "encode/AmfEncoder.h"
+
+#include <AMF/components/DisplayCapture.h>
+#include <AMF/core/Factory.h>
 #include "gpu/ColorConverter.h"
 #include "gpu/D3DDevice.h"
 #include "gpu/GpuTimer.h"
@@ -51,6 +54,8 @@ struct BenchOptions {
     bool rgbInput = false;  // hand BGRA to the encoder (no VideoProcessor pass)
     bool session = false;   // run the real CaptureSession + replay save instead of the raw loop
     bool forceVideoProcessor = false;
+    bool captureOnly = false; // capture and discard (compare capture APIs)
+    bool amdCapture = false;
     uint32_t replaySeconds = 5;
     std::wstring outDir;
     DWORD pid = 0; // session mode: capture only this process's audio
@@ -75,6 +80,8 @@ bool parse(const std::vector<std::wstring>& args, BenchOptions& o) {
         if (a == L"--rgb-input") { o.rgbInput = true; continue; }
         if (a == L"--session") { o.session = true; continue; }
         if (a == L"--video-processor") { o.forceVideoProcessor = true; continue; }
+        if (a == L"--capture-only") { o.captureOnly = true; continue; }
+        if (a == L"--amd-capture") { o.captureOnly = o.amdCapture = true; continue; }
         const std::wstring* v = next();
         if (!v) return false;
         if (a == L"--seconds") o.seconds = std::stod(*v);
@@ -258,6 +265,70 @@ private:
 // Accumulates wall time of a code section on the pump thread.
 const char* codecName(Codec c) { return c == Codec::H264 ? "H.264" : c == Codec::HEVC ? "HEVC" : "AV1"; }
 
+// Spike: capture with AMF's DisplayCapture component (AMD Direct Capture in the driver runtime)
+// or with WGC, doing nothing else with the frames, to compare what capture alone costs.
+int runCaptureOnly(const BenchOptions& o, HMONITOR monitor, bool amd) {
+    auto gpu = createGpuDevice({.monitor = monitor, .highGpuPriority = true});
+    if (!gpu) return 1;
+    const double hz = cyclesPerSecond();
+    uint64_t frames = 0;
+    if (!amd) {
+        WgcCapture capture(*gpu, CaptureTarget{.monitor = monitor}, CaptureOptions{.fps = o.fps, .cursor = o.cursor});
+        if (!capture.start()) return 1;
+        FrameTimer timer(o.fps);
+        const uint64_t c0 = processCycles();
+        const int64_t t0 = clock::now100ns(), end = t0 + clock::secondsTo100ns(o.seconds);
+        while (timer.waitNext() && clock::now100ns() < end)
+            if (capture.acquireLatest()) ++frames;
+        const double wall = clock::toSeconds(clock::now100ns() - t0);
+        std::println("WGC: {} frames ({:.1f}/s), CPU {:.2f}% of one core", frames, frames / wall,
+                     100.0 * (processCycles() - c0) / hz / wall);
+        return 0;
+    }
+    HMODULE dll = LoadLibraryExW(AMF_DLL_NAME, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    auto init = dll ? reinterpret_cast<AMFInit_Fn>(GetProcAddress(dll, AMF_INIT_FUNCTION_NAME)) : nullptr;
+    amf::AMFFactory* factory = nullptr;
+    if (!init || init(AMF_FULL_VERSION, &factory) != AMF_OK) {
+        std::println("error: no AMF runtime");
+        return 1;
+    }
+    amf::AMFContextPtr context;
+    amf::AMFComponentPtr capture;
+    factory->CreateContext(&context);
+    context->InitDX11(gpu->device.get());
+    AMF_RESULT r = factory->CreateComponent(context, AMFDisplayCapture, &capture);
+    if (r != AMF_OK) {
+        std::println("error: AMF DisplayCapture unavailable ({})", static_cast<int>(r));
+        return 1;
+    }
+    capture->SetProperty(AMF_DISPLAYCAPTURE_MONITOR_INDEX, amf_int64{o.monitorIndex});
+    // Non-blocking: hand back the current surface; our frame timer does the pacing.
+    capture->SetProperty(AMF_DISPLAYCAPTURE_MODE, amf_int64{AMF_DISPLAYCAPTURE_MODE_GET_CURRENT_SURFACE});
+    capture->SetProperty(AMF_DISPLAYCAPTURE_FRAMERATE, AMFConstructRate(o.fps, 1));
+    r = capture->Init(amf::AMF_SURFACE_UNKNOWN, 0, 0);
+    if (r != AMF_OK) {
+        std::println("error: DisplayCapture Init failed ({})", static_cast<int>(r));
+        return 1;
+    }
+    amf_int64 format = 0;
+    capture->GetProperty(AMF_DISPLAYCAPTURE_FORMAT, &format);
+    // Paced like the WGC run: one pass per frame interval, taking whatever is ready.
+    FrameTimer timer(o.fps);
+    const uint64_t c0 = processCycles();
+    const int64_t t0 = clock::now100ns(), end = t0 + clock::secondsTo100ns(o.seconds);
+    while (timer.waitNext() && clock::now100ns() < end) {
+        amf::AMFDataPtr data;
+        capture->QueryOutput(&data);
+        if (data) ++frames;
+    }
+    const double wall = clock::toSeconds(clock::now100ns() - t0);
+    std::println("AMD Direct Capture: {} frames ({:.1f}/s), CPU {:.2f}% of one core, surface format {}", frames,
+                 frames / wall, 100.0 * (processCycles() - c0) / hz / wall, format);
+    capture->Terminate();
+    context->Terminate();
+    return 0;
+}
+
 // Runs the production pipeline (CaptureSession -> ReplayBuffer -> ClipSaver) headlessly.
 int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
     constexpr UINT kSaved = WM_APP + 10;
@@ -278,6 +349,7 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
     cfg.settings.capture.captureCursor = o.cursor;
     if (o.rgbInput) cfg.settings.capture.convertPath = ConvertPath::EncoderNative;
     if (o.forceVideoProcessor) cfg.settings.capture.convertPath = ConvertPath::VideoProcessor;
+    if (o.amdCapture) cfg.settings.capture.method = CaptureMethod::AmdDirect;
     cfg.settings.replay.seconds = o.replaySeconds;
     if (!o.outDir.empty()) cfg.settings.output.folder = narrow(o.outDir);
 
@@ -402,6 +474,7 @@ int runBench(const std::vector<std::wstring>& args) {
 
     const HMONITOR monitor = monitorByIndex(o.monitorIndex);
     if (o.session) return runSessionBench(o, monitor);
+    if (o.captureOnly) return runCaptureOnly(o, monitor, o.amdCapture);
     auto gpu = createGpuDevice({.monitor = monitor, .highGpuPriority = true});
     if (!gpu) {
         std::println("error: {}", gpu.error());

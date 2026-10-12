@@ -4,6 +4,7 @@
 
 #include <AMF/components/Component.h>
 #include <AMF/core/Context.h>
+#include <AMF/core/Factory.h>
 #include <AMF/core/Surface.h>
 
 #include <array>
@@ -22,6 +23,8 @@ public:
 
     // Loads amfrt64.dll from the driver; false if this machine has no AMF runtime.
     static bool runtimeAvailable();
+    // The process-wide AMF factory (nullptr without a runtime); shared with AmdDirectCapture.
+    static amf::AMFFactory* factory();
 
     const char* name() const override { return "AMD AMF"; }
     bool init(const GpuDevice& gpu, const EncoderConfig& config) override;

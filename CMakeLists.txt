@@ -64,6 +64,7 @@ add_library(recordion_core STATIC
     src/gpu/GpuTimer.cpp
     src/capture/WgcCapture.cpp
     src/capture/FakeCapture.cpp
+    src/capture/AmdDirectCapture.cpp
     src/mux/Bitstream.cpp
     src/mux/Mp4Writer.cpp
     src/encode/AmfEncoder.cpp

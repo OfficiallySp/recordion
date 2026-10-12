@@ -73,6 +73,8 @@ const char* resultName(AMF_RESULT r) {
 
 bool AmfEncoder::runtimeAvailable() { return runtime().factory != nullptr; }
 
+amf::AMFFactory* AmfEncoder::factory() { return runtime().factory; }
+
 AmfEncoder::~AmfEncoder() { shutdown(); }
 
 template <class T>

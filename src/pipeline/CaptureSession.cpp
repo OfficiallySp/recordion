@@ -1,5 +1,6 @@
 #include "pipeline/CaptureSession.h"
 
+#include "capture/AmdDirectCapture.h"
 #include "capture/FakeCapture.h"
 #include "capture/WgcCapture.h"
 #include "core/Clock.h"
@@ -150,11 +151,19 @@ bool CaptureSession::initPipeline() {
 
     if (config_.synthetic) {
         source_ = std::make_unique<FakeCapture>(*gpu_, 1920, 1080);
-    } else {
-        source_ = std::make_unique<WgcCapture>(*gpu_, config_.target,
-                                               CaptureOptions{.fps = s.video.fps, .cursor = s.capture.captureCursor,
-                                                              .poolBuffers = kZeroCopyPoolBuffers});
+        return source_->start();
     }
+    if (s.capture.method == CaptureMethod::AmdDirect && gpu_->vendor == GpuVendor::AMD && !config_.target.window) {
+        auto direct = std::make_unique<AmdDirectCapture>(*gpu_, monitor);
+        if (direct->start()) {
+            source_ = std::move(direct);
+            return true;
+        }
+        log::warn("session: AMD Direct Capture unavailable; using Windows Graphics Capture");
+    }
+    source_ = std::make_unique<WgcCapture>(*gpu_, config_.target,
+                                           CaptureOptions{.fps = s.video.fps, .cursor = s.capture.captureCursor,
+                                                          .poolBuffers = kZeroCopyPoolBuffers});
     return source_->start();
 }
 
