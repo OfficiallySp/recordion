@@ -83,6 +83,9 @@ private:
     SettingsWindow settingsWindow_{*this};
     // The session was started only for a recording (instant replay is off): stop it afterwards.
     bool sessionOnlyForRecording_ = false;
+    bool restartPending_ = false;  // capture failed; one automatic restart is scheduled
+    bool resumeReplay_ = false;    // instant replay was on when the PC went to sleep
+    void scheduleRestart();
 };
 
 } // namespace rec

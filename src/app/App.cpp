@@ -34,6 +34,9 @@ std::wstring formatClipLength(double seconds) {
     return s < 60 ? std::format(L"{} s", s) : std::format(L"{}:{:02}", s / 60, s % 60);
 }
 
+constexpr UINT_PTR kRestartTimer = 1;
+constexpr UINT kRestartDelayMs = 2000;
+
 } // namespace
 
 App::App() = default;
@@ -132,13 +135,40 @@ LRESULT App::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case kMsgSession:
         if (session_) {
             const bool failed = wp == kSessionFailed;
+            const bool wanted = !sessionOnlyForRecording_ || game_;
             if (recording()) recorder_->stop(clock::now100ns()); // keeps what was captured
             stopReplay();
-            toast(failed ? L"Instant replay stopped" : L"Capture ended",
-                  failed ? L"The encoder stopped working. Check the log for details." : L"The captured display went away.",
-                  failed ? Notifier::Kind::Error : Notifier::Kind::Info);
+            // A GPU driver reset or update, or a display coming and going: try again once, shortly.
+            if (wanted && !restartPending_) {
+                scheduleRestart();
+            } else {
+                toast(failed ? L"Instant replay stopped" : L"Capture ended",
+                      failed ? L"Capture keeps failing. Check the log for details." : L"The captured display went away.",
+                      failed ? Notifier::Kind::Error : Notifier::Kind::Info);
+            }
         }
         return 0;
+    case WM_TIMER:
+        if (wp == kRestartTimer) {
+            KillTimer(hwnd_, kRestartTimer);
+            if (game_) game_->monitor = MonitorFromWindow(game_->window, MONITOR_DEFAULTTOPRIMARY); // it may have moved
+            startReplay();
+            restartPending_ = false;
+            if (!replayOn()) toast(L"Instant replay stopped", L"Capture couldn't be restarted. Check the log.", Notifier::Kind::Error);
+            else log::info("capture restarted");
+        }
+        return 0;
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMSUSPEND) {
+            // Finish files and release the GPU before sleep; the device won't survive it anyway.
+            resumeReplay_ = replayOn() && (!sessionOnlyForRecording_ || game_);
+            if (recording()) recorder_->stop(clock::now100ns());
+            stopReplay();
+        } else if (wp == PBT_APMRESUMEAUTOMATIC && resumeReplay_) {
+            resumeReplay_ = false;
+            scheduleRestart();
+        }
+        return TRUE;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case kMenuToggleReplay: onHotkey(HotkeyAction::ToggleReplayBuffer); break;
@@ -244,6 +274,11 @@ void App::startReplay() {
               Notifier::Kind::Error);
     }
     updateTray();
+}
+
+void App::scheduleRestart() {
+    restartPending_ = true;
+    SetTimer(hwnd_, kRestartTimer, kRestartDelayMs, nullptr);
 }
 
 void App::stopReplay() {

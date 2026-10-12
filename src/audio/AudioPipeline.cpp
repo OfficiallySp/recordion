@@ -4,6 +4,8 @@
 #include "core/Log.h"
 #include "core/ThreadQos.h"
 
+#include <mmdeviceapi.h>
+
 #include <winrt/base.h>
 
 #include <algorithm>
@@ -18,6 +20,25 @@ constexpr int64_t kFrame = AacEncoder::kFrameSamples;
 constexpr int64_t kMixLatencyFrames = AudioTimeline::kRate / 10; // 100 ms
 constexpr DWORD kPollMs = 10;
 constexpr int64_t kRetry100ns = 10'000'000; // reopen a lost device after 1 s
+
+// Tells the audio thread when the user picks a different default output or input device, so
+// "system audio" and "default microphone" follow it right away.
+struct DefaultDeviceWatcher : winrt::implements<DefaultDeviceWatcher, IMMNotificationClient> {
+    std::atomic<bool> outputChanged{false};
+    std::atomic<bool> inputChanged{false};
+    HANDLE wake = nullptr;
+
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
+        if (role != eConsole) return S_OK;
+        (flow == eRender ? outputChanged : inputChanged).store(true);
+        if (wake) SetEvent(wake);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+};
 
 int16_t toPcm16(float v) {
     v = std::clamp(v, -1.0f, 1.0f);
@@ -111,16 +132,33 @@ void AudioPipeline::run() {
         return;
     }
 
+    winrt::com_ptr<IMMDeviceEnumerator> enumerator;
+    auto watcher = winrt::make_self<DefaultDeviceWatcher>();
+    watcher->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(enumerator.put()))))
+        enumerator->RegisterEndpointNotificationCallback(watcher.get());
+
     std::vector<HANDLE> waits;
     for (;;) {
         waits.assign({stopEvent_.get()});
+        if (watcher->wake) waits.push_back(watcher->wake); // a null handle would fail every wait
         for (auto& s : sources_)
             if (s->active) waits.push_back(s->wasapi.event());
         const DWORD r = WaitForMultipleObjects(static_cast<DWORD>(waits.size()), waits.data(), FALSE, kPollMs);
         if (r == WAIT_OBJECT_0) break;
 
         const int64_t now = clock::now100ns();
+        const bool outputChanged = watcher->outputChanged.exchange(false);
+        const bool inputChanged = watcher->inputChanged.exchange(false) && config_.micDeviceId.empty();
         for (auto& s : sources_) {
+            const bool follow = (outputChanged && s->kind == WasapiSource::Kind::SystemLoopback) ||
+                                (inputChanged && s->kind == WasapiSource::Kind::Microphone);
+            if (follow && s->active) {
+                log::info("audio: default device changed; switching");
+                s->wasapi.stop();
+                openSource(*s);
+                continue;
+            }
             if (s->active && !s->wasapi.read(timeline_, s->ring)) {
                 log::info("audio: device lost; reopening");
                 s->wasapi.stop();
@@ -133,6 +171,8 @@ void AudioPipeline::run() {
         mixAndEncode(timeline_.toSample(now) - kMixLatencyFrames);
     }
 
+    if (enumerator) enumerator->UnregisterEndpointNotificationCallback(watcher.get());
+    if (watcher->wake) CloseHandle(watcher->wake);
     for (size_t ti = 0; ti < tracks_.size(); ++ti)
         tracks_[ti]->encoder.drain([&](std::span<const uint8_t> frame, uint64_t k) { emit(ti, k, frame); });
     for (auto& s : sources_) s->wasapi.stop();
