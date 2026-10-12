@@ -67,6 +67,9 @@ add_library(recordion_core STATIC
     src/mux/Bitstream.cpp
     src/mux/Mp4Writer.cpp
     src/encode/AmfEncoder.cpp
+    src/encode/NvencEncoder.cpp
+    src/encode/QsvEncoder.cpp
+    src/encode/EncoderFactory.cpp
     src/buffer/ReplayBuffer.cpp
     src/output/FileNaming.cpp
     src/output/AsyncFileWriter.cpp
@@ -81,9 +84,11 @@ add_library(recordion_core STATIC
     src/detect/GameDetector.cpp
 )
 target_sources(recordion_core PRIVATE ${SHADER_HEADERS})
+# oneVPL's D3D11 surface import (2.10+) is still declared under ONEVPL_EXPERIMENTAL.
+target_compile_definitions(recordion_core PUBLIC ONEVPL_EXPERIMENTAL)
 target_include_directories(recordion_core PUBLIC src PRIVATE ${SHADER_OUT})
 target_link_libraries(recordion_core
-    PUBLIC recordion_options WIL::WIL amf_headers nvenc_headers
+    PUBLIC recordion_options WIL::WIL amf_headers nvenc_headers VPL::dispatcher
     PRIVATE nlohmann_json::nlohmann_json
     PUBLIC d3d11 dxgi avrt shell32 ole32 windowsapp mfplat mfuuid wmcodecdspuuid mmdevapi dwmapi pdh version)
 

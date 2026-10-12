@@ -8,7 +8,7 @@
 #include "core/Paths.h"
 #include "core/ThreadQos.h"
 #include "core/Utf.h"
-#include "encode/AmfEncoder.h"
+#include "encode/EncoderFactory.h"
 #include "mux/Bitstream.h"
 #include "output/ClipSaver.h"
 #include "output/Recorder.h"
@@ -136,11 +136,17 @@ bool CaptureSession::initPipeline() {
         return false;
     }
     gpu_ = std::move(*gpu);
-    if (!AmfEncoder::runtimeAvailable()) {
-        // NVENC and QSV backends come next; until then AMF is required.
-        log::error("session: no supported hardware encoder on {}", gpu_->adapterName);
+    if (!encoderAvailable(gpu_->vendor)) {
+        log::error("session: no hardware encoder runtime for {} ({}); is the GPU driver installed?", gpu_->adapterName,
+                   gpuVendorName(gpu_->vendor));
         return false;
     }
+    const EncoderVendor wanted = s.video.vendor;
+    const bool matches = wanted == EncoderVendor::Auto || (wanted == EncoderVendor::AMD && gpu_->vendor == GpuVendor::AMD) ||
+                         (wanted == EncoderVendor::NVIDIA && gpu_->vendor == GpuVendor::NVIDIA) ||
+                         (wanted == EncoderVendor::Intel && gpu_->vendor == GpuVendor::Intel);
+    if (!matches)
+        log::warn("session: the chosen encoder must run on the GPU driving this display; using {}", gpuVendorName(gpu_->vendor));
 
     if (config_.synthetic) {
         source_ = std::make_unique<FakeCapture>(*gpu_, 1920, 1080);
@@ -181,7 +187,7 @@ bool CaptureSession::configureEncoder(Size captureSize, Size textureSize) {
                              outputSize_ == captureSize && captureSize == textureSize && !ec.tenBit;
     zeroCopy_ = false;
     if (canZeroCopy) {
-        auto enc = std::make_unique<AmfEncoder>();
+        auto enc = makeEncoder(gpu_->vendor);
         ec.rgbInput = true;
         if (enc->init(*gpu_, ec) && (enc->hardwareRgbConversion() || path == ConvertPath::EncoderNative)) {
             encoder_ = std::move(enc);
@@ -190,7 +196,7 @@ bool CaptureSession::configureEncoder(Size captureSize, Size textureSize) {
     }
     if (!encoder_) {
         ec.rgbInput = false;
-        auto enc = std::make_unique<AmfEncoder>();
+        auto enc = makeEncoder(gpu_->vendor);
         if (!enc->init(*gpu_, ec)) return false;
         encoder_ = std::move(enc);
         if (!converter_.init(gpu_->device.get(), gpu_->context.get(), textureSize, outputSize_, encoder_->inputFormat(),

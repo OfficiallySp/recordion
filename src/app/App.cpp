@@ -5,7 +5,7 @@
 #include "core/Paths.h"
 #include "core/ThreadQos.h"
 #include "core/Utf.h"
-#include "encode/AmfEncoder.h"
+#include "encode/EncoderFactory.h"
 #include "core/Clock.h"
 #include "output/ClipSaver.h"
 #include "output/Recorder.h"
@@ -454,11 +454,7 @@ std::vector<std::string> App::statusLines() const {
     return lines;
 }
 
-std::vector<std::string> App::availableEncoders() const {
-    std::vector<std::string> out;
-    if (AmfEncoder::runtimeAvailable()) out.emplace_back("AMD (AMF)");
-    return out;
-}
+std::vector<std::string> App::availableEncoders() const { return availableEncoderNames(); }
 
 void App::editSettingsFile() {
     ShellExecuteW(nullptr, L"open", L"notepad.exe", settingsFile_.c_str(), nullptr, SW_SHOWNORMAL);

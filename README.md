@@ -7,14 +7,15 @@ A lightweight game and desktop recorder for Windows 11, in the spirit of ShadowP
 - **Automatic game detection** (Steam, Epic, GOG, Ubisoft, Xbox libraries and Windows' game list,
   plus fullscreen/GPU behaviour); clips go into a folder named after the game
 - **Audio**: game-only (per-process) or system audio, optional microphone, optional separate tracks
-- **Hardware encoding** with H.264, HEVC and AV1 (8/10-bit) on AMD AMF (NVIDIA NVENC and Intel QSV next)
+- **Hardware encoding** with H.264, HEVC and AV1 (8/10-bit) on AMD AMF, NVIDIA NVENC and Intel Quick Sync
 - **Zero-copy pipeline**: captured frames never touch the CPU; on AMD the encoder's fixed-function
   colour converter takes the captured image directly
 - **Organised output**: `Videos\Recordion\<Game>\<Game> 2026-10-11 21-34-07 Replay.mp4`
 - **Rebindable global hotkeys**, no process injection (anti-cheat safe)
 
-Status: instant replay, recording, audio and game detection work on AMD GPUs. NVENC/QSV and the
-settings window are in progress.
+Status: instant replay, recording, audio, game detection and the settings window work and are
+tested on AMD (AMF). The NVENC and Quick Sync backends are implemented but not yet tested on
+NVIDIA/Intel hardware.
 
 ## Build
 
