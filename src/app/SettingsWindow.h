@@ -61,6 +61,8 @@ private:
     void drawHotkeys();
     void drawGames();
     void drawStatus();
+    void drawAbout();
+    void loadSystemInfo();
     bool captureHotkey(UINT msg, WPARAM wp);
     void loadMicrophones();
 
@@ -80,6 +82,8 @@ private:
     int capturingHotkey_ = -1;
     std::string hotkeyError_;
     std::vector<std::pair<std::string, std::string>> microphones_; // id, name
+    std::vector<std::string> gpus_;
+    std::string windowsBuild_;
 };
 
 } // namespace rec

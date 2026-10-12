@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(recordion VERSION 0.1.0 LANGUAGES CXX RC)
+project(recordion VERSION 1.0.0 LANGUAGES CXX RC)
 
 if(NOT MSVC)
     message(FATAL_ERROR "Recordion targets Windows with MSVC only")
@@ -93,6 +93,9 @@ target_link_libraries(recordion_core
     PRIVATE nlohmann_json::nlohmann_json
     PUBLIC d3d11 dxgi avrt shell32 ole32 windowsapp mfplat mfuuid wmcodecdspuuid mmdevapi dwmapi pdh version)
 
+# Version.h: the single place the version comes from (About page, file properties).
+configure_file(src/app/Version.h.in ${CMAKE_BINARY_DIR}/generated/Version.h @ONLY)
+
 add_executable(recordion WIN32
     src/app/main.cpp
     src/app/App.cpp
@@ -104,6 +107,7 @@ add_executable(recordion WIN32
     src/app/recordion.rc
     src/app/recordion.manifest
 )
+target_include_directories(recordion PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(recordion PRIVATE recordion_core imgui::imgui psapi d2d1 dwrite winmm shcore dwmapi d3d11 dxgi windowscodecs)
 
 enable_testing()

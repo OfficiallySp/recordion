@@ -1,5 +1,7 @@
 #include "app/SettingsWindow.h"
 
+#include "Version.h"
+
 #include "buffer/ReplayBuffer.h"
 #include "core/Hotkey.h"
 #include "core/Log.h"
@@ -10,6 +12,7 @@
 #include <dwmapi.h>
 #include <mmdeviceapi.h>
 #include <shellscalingapi.h>
+#include <shellapi.h>
 #include <shobjidl.h>
 #include <wincodec.h>
 
@@ -35,7 +38,25 @@ constexpr float kWidth = 760, kHeight = 560;
 // PKEY_Device_FriendlyName (functiondiscoverykeys_devpkey.h), defined here to avoid INITGUID games.
 constexpr PROPERTYKEY kDeviceFriendlyName{{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
 
-const char* kPages[] = {"General", "Video", "Instant replay", "Audio", "Hotkeys", "Games", "Status"};
+const char* kPages[] = {"General", "Video", "Instant replay", "Audio", "Hotkeys", "Games", "Status", "About"};
+
+struct Component {
+    const char* name;
+    const char* license;
+    const char* use;
+};
+constexpr Component kComponents[] = {
+    {"Dear ImGui", "MIT", "this settings window"},
+    {"AMD AMF SDK headers", "MIT", "AMD hardware encoding and display capture"},
+    {"NVIDIA Video Codec SDK headers (nv-codec-headers)", "MIT", "NVIDIA hardware encoding"},
+    {"Intel oneVPL dispatcher (libvpl)", "MIT", "Intel Quick Sync encoding"},
+    {"Windows Implementation Libraries (WIL)", "MIT", "Windows resource helpers"},
+    {"nlohmann/json", "MIT", "settings and game manifests"},
+};
+
+void openShell(const std::wstring& target) {
+    ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
 
 struct HotkeyRow {
     const char* label;
@@ -76,9 +97,16 @@ void hint(const char* text) {
     ImGui::PopStyleColor();
 }
 
+ImFont* g_headingFont = nullptr; // Segoe UI Semibold, when installed
+
+// Section header: a semibold label with a hairline rule under it.
 void heading(const char* text) {
-    ImGui::Spacing();
-    ImGui::SeparatorText(text);
+    ImGui::Dummy({0, ImGui::GetStyle().ItemSpacing.y});
+    ImGui::PushFont(g_headingFont, ImGui::GetStyle().FontSizeBase * 1.1f);
+    ImGui::TextUnformatted(text);
+    ImGui::PopFont();
+    ImGui::Separator();
+    ImGui::Dummy({0, ImGui::GetStyle().ItemSpacing.y * 0.25f});
 }
 
 std::string formatLength(uint32_t seconds) {
@@ -137,6 +165,7 @@ void applyTheme(float scale) {
     c[ImGuiCol_CheckMark] = accent;
     c[ImGuiCol_SliderGrab] = accent;
     c[ImGuiCol_SliderGrabActive] = {1.0f, 0.30f, 0.33f, 1};
+    c[ImGuiCol_Separator] = {0.21f, 0.21f, 0.24f, 1};
     c[ImGuiCol_SeparatorHovered] = accent;
     c[ImGuiCol_TextSelectedBg] = {accent.x, accent.y, accent.z, 0.35f};
     s.ScaleAllSizes(scale);
@@ -192,6 +221,10 @@ void SettingsWindow::open(HINSTANCE instance, HICON icon, bool visible) {
     io.IniFilename = nullptr; // nothing to persist; the window always opens the same way
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     font_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16.0f);
+    std::error_code ec;
+    g_headingFont = std::filesystem::exists(L"C:\\Windows\\Fonts\\seguisb.ttf", ec)
+                        ? io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf", 16.0f)
+                        : nullptr;
     ImGui_ImplWin32_Init(hwnd_);
     ImGui_ImplDX11_Init(device_.get(), context_.get());
     applyDpi();
@@ -199,6 +232,7 @@ void SettingsWindow::open(HINSTANCE instance, HICON icon, bool visible) {
     draft_ = host_.currentSettings();
     message_.clear();
     loadMicrophones();
+    loadSystemInfo();
     if (!visible) return;
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd_);
@@ -433,6 +467,7 @@ void SettingsWindow::drawUi() {
     case 4: drawHotkeys(); break;
     case 5: drawGames(); break;
     case 6: drawStatus(); break;
+    case 7: drawAbout(); break;
     }
     ImGui::PopItemWidth();
     ImGui::EndChild();
@@ -676,6 +711,74 @@ void SettingsWindow::drawStatus() {
     heading("Files");
     hint(std::format("Settings: {}", narrow((paths::configDir() / L"settings.json").wstring())).c_str());
     hint(std::format("Logs: {}", narrow(paths::logDir().wstring())).c_str());
+}
+
+void SettingsWindow::drawAbout() {
+    ImGui::Spacing();
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.9f);
+    ImGui::TextUnformatted("Recordion");
+    ImGui::PopFont();
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("version %s", RECORDION_VERSION_STRING);
+    ImGui::TextWrapped("A lightweight game and desktop recorder. Instant replay, recording and automatic game detection, "
+                       "encoded on your GPU's dedicated video hardware so your games keep their performance.");
+
+    heading("This PC");
+    for (const auto& gpu : gpus_) ImGui::BulletText("%s", gpu.c_str());
+    const auto encoders = host_.availableEncoders();
+    std::string encoderText;
+    for (const auto& e : encoders) encoderText += (encoderText.empty() ? "" : ", ") + e;
+    ImGui::BulletText("Hardware encoders: %s", encoderText.empty() ? "none found" : encoderText.c_str());
+    if (!windowsBuild_.empty()) ImGui::BulletText("Windows build %s", windowsBuild_.c_str());
+
+    heading("Build");
+    ImGui::BulletText("64-bit, built %s with MSVC %d.%02d.%d", __DATE__, _MSC_FULL_VER / 10000000,
+                      (_MSC_FULL_VER / 100000) % 100, _MSC_FULL_VER % 100000);
+
+    heading("Folders and links");
+    if (ImGui::Button("Videos")) {
+        const auto root = draft_.outputRoot();
+        std::error_code ec;
+        std::filesystem::create_directories(root, ec);
+        openShell(root.wstring());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Settings")) openShell(paths::configDir().wstring());
+    ImGui::SameLine();
+    if (ImGui::Button("Logs")) openShell(paths::logDir().wstring());
+    ImGui::SameLine();
+    if (ImGui::Button("Project page")) openShell(widen(RECORDION_REPOSITORY_URL));
+
+    heading("Open-source components");
+    for (const auto& c : kComponents) ImGui::BulletText("%s (%s): %s", c.name, c.license, c.use);
+    hint("Full license texts are in THIRD_PARTY_NOTICES.txt next to recordion.exe.");
+    ImGui::Spacing();
+    ImGui::TextDisabled("Copyright (C) 2026 Shane");
+}
+
+void SettingsWindow::loadSystemInfo() {
+    gpus_.clear();
+    winrt::com_ptr<IDXGIFactory1> factory;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put())))) {
+        winrt::com_ptr<IDXGIAdapter1> adapter;
+        for (UINT i = 0; factory->EnumAdapters1(i, adapter.put()) != DXGI_ERROR_NOT_FOUND; ++i) {
+            DXGI_ADAPTER_DESC1 d{};
+            adapter->GetDesc1(&d);
+            if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+                gpus_.push_back(std::format("{} ({:.0f} GB)", narrow(d.Description),
+                                            (d.DedicatedVideoMemory + d.SharedSystemMemory) / 1073741824.0));
+            adapter = nullptr;
+        }
+    }
+    wchar_t build[32] = {};
+    DWORD size = sizeof(build), ubr = 0, ubrSize = sizeof(ubr);
+    const wchar_t* key = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key, L"CurrentBuild", RRF_RT_REG_SZ, nullptr, build, &size) == ERROR_SUCCESS) {
+        windowsBuild_ = narrow(build);
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, key, L"UBR", RRF_RT_REG_DWORD, nullptr, &ubr, &ubrSize) == ERROR_SUCCESS)
+            windowsBuild_ += std::format(".{}", ubr);
+    }
 }
 
 void SettingsWindow::loadMicrophones() {
