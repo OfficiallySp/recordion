@@ -76,13 +76,16 @@ add_library(recordion_core STATIC
     src/audio/AacEncoder.cpp
     src/audio/WasapiSource.cpp
     src/audio/AudioPipeline.cpp
+    src/detect/GameLibrary.cpp
+    src/detect/GameRules.cpp
+    src/detect/GameDetector.cpp
 )
 target_sources(recordion_core PRIVATE ${SHADER_HEADERS})
 target_include_directories(recordion_core PUBLIC src PRIVATE ${SHADER_OUT})
 target_link_libraries(recordion_core
     PUBLIC recordion_options WIL::WIL amf_headers nvenc_headers
     PRIVATE nlohmann_json::nlohmann_json
-    PUBLIC d3d11 dxgi avrt shell32 ole32 windowsapp mfplat mfuuid wmcodecdspuuid mmdevapi)
+    PUBLIC d3d11 dxgi avrt shell32 ole32 windowsapp mfplat mfuuid wmcodecdspuuid mmdevapi dwmapi pdh version)
 
 add_executable(recordion WIN32
     src/app/main.cpp
@@ -107,6 +110,7 @@ add_executable(recordion_tests
     tests/test_replay_buffer.cpp
     tests/test_file_writer.cpp
     tests/test_audio.cpp
+    tests/test_detect.cpp
 )
 target_link_libraries(recordion_tests PRIVATE recordion_core doctest::doctest)
 target_compile_definitions(recordion_tests PRIVATE RECORDION_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data")

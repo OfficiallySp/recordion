@@ -4,11 +4,13 @@
 #include "app/Notifier.h"
 #include "app/Tray.h"
 #include "core/Settings.h"
+#include "detect/GameDetector.h"
 
 #include <windows.h>
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 namespace rec {
 
@@ -23,6 +25,8 @@ public:
     static constexpr UINT kMsgActivate = WM_APP + 2; // a second instance was launched
     static constexpr UINT kMsgSaved = WM_APP + 3;    // lParam: SaveResult*
     static constexpr UINT kMsgSession = WM_APP + 4;  // wParam: kSessionFailed / kSessionEnded
+    static constexpr UINT kMsgGameStarted = WM_APP + 5; // lParam: DetectedGame*
+    static constexpr UINT kMsgGameEnded = WM_APP + 6;   // wParam: pid
 
     App();
     ~App();
@@ -47,6 +51,8 @@ private:
     void startRecording();
     void stopRecording();
     void onSaved(LPARAM result);
+    void onGameStarted(LPARAM game);
+    void onGameEnded(DWORD pid);
     void updateTray();
     void toast(std::wstring_view title, std::wstring_view detail, Notifier::Kind kind);
 
@@ -62,6 +68,8 @@ private:
     std::unique_ptr<ClipSaver> saver_;
     std::unique_ptr<Recorder> recorder_;
     std::unique_ptr<CaptureSession> session_;
+    std::unique_ptr<GameDetector> detector_;
+    std::optional<DetectedGame> game_; // the game being played, if any
     // The session was started only for a recording (instant replay is off): stop it afterwards.
     bool sessionOnlyForRecording_ = false;
 };

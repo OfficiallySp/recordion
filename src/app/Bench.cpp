@@ -7,6 +7,7 @@
 #include "core/Log.h"
 #include "core/ThreadQos.h"
 #include "core/Utf.h"
+#include "detect/GameLibrary.h"
 #include "encode/AmfEncoder.h"
 #include "gpu/ColorConverter.h"
 #include "gpu/D3DDevice.h"
@@ -357,6 +358,14 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
 } // namespace
 
 int runBench(const std::vector<std::wstring>& args) {
+    if (args.size() >= 2 && args[1] == L"--games") {
+        GameLibrary lib;
+        lib.build();
+        std::println("installed titles: {}, library folders: {}, known to Windows: {}", lib.installCount(),
+                     lib.rootCount(), lib.knownExeCount());
+        for (const auto& name : lib.installNames()) std::println("  {}", name);
+        return 0;
+    }
     BenchOptions o;
     if (!parse(args, o)) {
         usage();

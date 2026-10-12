@@ -60,6 +60,8 @@ int App::run(HINSTANCE instance) {
     notifier_.create(instance);
     saver_ = std::make_unique<ClipSaver>(hwnd_, kMsgSaved);
     recorder_ = std::make_unique<Recorder>(hwnd_, kMsgSaved);
+    detector_ = std::make_unique<GameDetector>(hwnd_, kMsgGameStarted, kMsgGameEnded);
+    detector_->start(settings_.detection);
     applyHotkeys();
     log::info("Recordion started; output folder {}", narrow(settings_.outputRoot().wstring()));
     if (settings_.replay.desktopAlwaysOn) startReplay();
@@ -71,6 +73,7 @@ int App::run(HINSTANCE instance) {
         DispatchMessageW(&msg);
     }
 
+    detector_.reset();
     if (recording()) recorder_->stop(clock::now100ns());
     recorder_.reset(); // finishes the recording's file
     stopReplay();
@@ -112,6 +115,12 @@ LRESULT App::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case kMsgSaved:
         onSaved(lp);
         return 0;
+    case kMsgGameStarted:
+        onGameStarted(lp);
+        return 0;
+    case kMsgGameEnded:
+        onGameEnded(static_cast<DWORD>(wp));
+        return 0;
     case kMsgSession:
         if (session_) {
             const bool failed = wp == kSessionFailed;
@@ -134,6 +143,7 @@ LRESULT App::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             stopReplay();
             loadSettings();
             applyHotkeys();
+            detector_->setSettings(settings_.detection);
             if (wasOn) startReplay();
             break;
         }
@@ -204,9 +214,17 @@ bool App::replayOn() const { return session_ && session_->running(); }
 void App::startReplay() {
     if (replayOn()) return;
     SessionConfig cfg;
-    // Game sessions arrive with automatic game detection; until then this is the desktop.
-    cfg.target.monitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
-    cfg.name = "Desktop";
+    if (game_) {
+        // The game's display by default (survives the game recreating its window); the window
+        // itself if the user asked for that.
+        if (settings_.capture.gameWindowOnly) cfg.target.window = game_->window;
+        else cfg.target.monitor = game_->monitor;
+        cfg.name = game_->name;
+        cfg.processId = game_->pid;
+    } else {
+        cfg.target.monitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        cfg.name = "Desktop";
+    }
     cfg.settings = settings_;
     cfg.notifyWindow = hwnd_;
     cfg.notifyMessage = kMsgSession;
@@ -270,14 +288,50 @@ void App::onSaved(LPARAM lp) {
     updateTray();
 }
 
+void App::onGameStarted(LPARAM lp) {
+    std::unique_ptr<DetectedGame> g(reinterpret_cast<DetectedGame*>(lp));
+    game_ = *g;
+    if (!settings_.replay.enabledInGames) {
+        updateTray();
+        return;
+    }
+    if (recording()) {
+        // Don't cut a recording in progress; the game gets its own session when it stops.
+        toast(widen(game_->name), L"Detected. Your recording continues.", Notifier::Kind::Info);
+        updateTray();
+        return;
+    }
+    stopReplay(); // the desktop session, if one was running
+    startReplay();
+    if (replayOn()) {
+        toast(widen(game_->name),
+              std::format(L"Instant replay on · {} saves the last {}", widen(settings_.hotkeys.saveReplay),
+                          formatClipLength(settings_.replay.seconds)),
+              Notifier::Kind::Info);
+    }
+}
+
+void App::onGameEnded(DWORD pid) {
+    if (!game_ || game_->pid != pid) return;
+    game_.reset();
+    if (session_ && session_->config().processId == pid) {
+        if (recording()) recorder_->stop(clock::now100ns()); // the file keeps everything up to now
+        stopReplay();
+        if (settings_.replay.desktopAlwaysOn) startReplay();
+    }
+    updateTray();
+}
+
 void App::toast(std::wstring_view title, std::wstring_view detail, Notifier::Kind kind) {
     notifier_.show(title, detail, kind, settings_.general.notificationSound);
 }
 
 void App::updateTray() {
-    tray_.setTooltip(recording()                                  ? L"Recordion – recording"
-                     : replayOn() && !sessionOnlyForRecording_ ? L"Recordion – instant replay on"
-                                                                : L"Recordion");
+    std::wstring tip = L"Recordion";
+    if (game_) tip += L" – " + widen(game_->name);
+    if (recording()) tip += L" – recording";
+    else if (replayOn() && !sessionOnlyForRecording_) tip += L" – instant replay on";
+    tray_.setTooltip(tip);
 }
 
 void App::showTrayMenu() {
