@@ -14,6 +14,7 @@
 #include "mux/Bitstream.h"
 #include "mux/Mp4Writer.h"
 #include "output/ClipSaver.h"
+#include "output/Recorder.h"
 #include "pipeline/CaptureSession.h"
 
 #include <windows.h>
@@ -51,6 +52,7 @@ struct BenchOptions {
     uint32_t replaySeconds = 5;
     std::wstring outDir;
     DWORD pid = 0; // session mode: capture only this process's audio
+    double recordSeconds = 0; // session mode: also make a manual recording this long
 };
 
 void usage() {
@@ -83,6 +85,7 @@ bool parse(const std::vector<std::wstring>& args, BenchOptions& o) {
         else if (a == L"--replay") o.replaySeconds = static_cast<uint32_t>(std::stoul(*v));
         else if (a == L"--out-dir") o.outDir = *v;
         else if (a == L"--pid") o.pid = static_cast<DWORD>(std::stoul(*v));
+        else if (a == L"--record") o.recordSeconds = std::stod(*v);
         else if (a == L"--synthetic-size") {
             const auto x = v->find(L'x');
             if (x == std::wstring::npos) return false;
@@ -284,7 +287,26 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
         std::println("error: session failed to start (see log)");
         return 1;
     }
-    Sleep(static_cast<DWORD>(o.seconds * 1000));
+    std::optional<SaveResult> recording;
+    if (o.recordSeconds > 0) {
+        // Record in the middle of the session: start after 1 s, stop after recordSeconds.
+        Recorder recorder(window, kSaved);
+        Sleep(1000);
+        session.startRecording(recorder, 0);
+        Sleep(static_cast<DWORD>(o.recordSeconds * 1000));
+        recorder.stop(clock::now100ns());
+        MSG m;
+        while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+            if (m.message == kSaved) {
+                std::unique_ptr<SaveResult> r(reinterpret_cast<SaveResult*>(m.lParam));
+                recording = *r;
+                break;
+            }
+            DispatchMessageW(&m);
+        }
+    }
+    const double remaining = o.seconds - clock::toSeconds(clock::now100ns() - t0);
+    if (remaining > 0) Sleep(static_cast<DWORD>(remaining * 1000));
     const double wall = clock::toSeconds(clock::now100ns() - t0);
     const double cpu = (processCycles() - cpu0) / hz;
 
@@ -314,6 +336,15 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
     std::println("replay buffer:        {:.1f} / {:.1f} MB", st.buffer.usedBytes / 1048576.0,
                  st.buffer.capacityBytes / 1048576.0);
     std::println("CPU (whole process):  {:.2f}% of one core", 100 * cpu / wall);
+    if (recording) {
+        if (recording->ok) {
+            std::println("recording:            {:.2f} s, {:.1f} MB{}{}", recording->seconds,
+                         recording->bytes / 1048576.0, recording->error.empty() ? "" : " - ", recording->error);
+            std::println("recording file:       {}", narrow(recording->path.wstring()));
+        } else {
+            std::println("recording FAILED:     {}", recording->error);
+        }
+    }
     if (!result.ok) {
         std::println("save FAILED: {}", result.error);
         return 1;

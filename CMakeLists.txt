@@ -71,6 +71,7 @@ add_library(recordion_core STATIC
     src/output/FileNaming.cpp
     src/output/AsyncFileWriter.cpp
     src/output/ClipSaver.cpp
+    src/output/Recorder.cpp
     src/pipeline/CaptureSession.cpp
     src/audio/AacEncoder.cpp
     src/audio/WasapiSource.cpp

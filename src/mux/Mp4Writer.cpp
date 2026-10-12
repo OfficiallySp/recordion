@@ -2,6 +2,8 @@
 
 #include "mux/BoxWriter.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <chrono>
 #include <format>
@@ -38,6 +40,8 @@ struct Track {
 };
 
 uint32_t videoTimescale(const Mp4VideoTrack& v) { return v.fpsDen == 1 ? v.fpsNum * 1000 : v.fpsNum; }
+
+uint32_t sampleSize(const Mp4Sample& s) { return s.data.empty() ? s.size : static_cast<uint32_t>(s.data.size()); }
 
 void layoutVideo(Track& t, const Mp4ClipInput& in) {
     const auto& s = in.videoSamples;
@@ -90,11 +94,12 @@ uint32_t chunkSampleCount(const Track& t, size_t chunk) {
     return end - t.chunkFirstSample[chunk];
 }
 
-void writeFtyp(BoxWriter& w, Codec codec) {
+void writeFtyp(BoxWriter& w, Codec codec, bool fragmented = false) {
     const size_t b = w.begin("ftyp");
     w.fourcc("isom");
     w.u32(0x200);
     for (const char* brand : {"isom", "iso2", "mp41"}) w.fourcc(brand);
+    if (fragmented) w.fourcc("iso6");
     if (codec == Codec::H264) w.fourcc("avc1");
     if (codec == Codec::AV1) w.fourcc("av01");
     w.end(b);
@@ -231,7 +236,7 @@ void writeStbl(BoxWriter& w, const Track& t, const Mp4ClipInput& in) {
     const size_t stsz = w.beginFull("stsz", 0, 0);
     w.u32(0);
     w.u32(static_cast<uint32_t>(samples.size()));
-    for (const auto& s : samples) w.u32(static_cast<uint32_t>(s.data.size()));
+    for (const auto& s : samples) w.u32(sampleSize(s));
     w.end(stsz);
 
     const size_t co64 = w.beginFull("co64", 0, 0);
@@ -352,7 +357,7 @@ void writeUdta(BoxWriter& w, const Mp4ClipInput& in) {
     w.end(udta);
 }
 
-void writeMoov(BoxWriter& w, const std::vector<Track>& tracks, const Mp4ClipInput& in) {
+void writeMoov(BoxWriter& w, const std::vector<Track>& tracks, const Mp4ClipInput& in, bool fragmented = false) {
     const uint64_t macTime = static_cast<uint64_t>(std::max<int64_t>(0, in.creationUnixTime)) + kMp4EpochOffset;
     uint64_t movieDuration = 0;
     for (const auto& t : tracks) movieDuration = std::max(movieDuration, t.emptyEditMovie + t.editDurationMovie);
@@ -371,16 +376,27 @@ void writeMoov(BoxWriter& w, const std::vector<Track>& tracks, const Mp4ClipInpu
     w.u32(static_cast<uint32_t>(tracks.size() + 1)); // next_track_ID
     w.end(mvhd);
     for (const auto& t : tracks) writeTrak(w, t, in, macTime);
+    if (fragmented) {
+        const size_t mvex = w.begin("mvex");
+        for (const auto& t : tracks) {
+            const size_t trex = w.beginFull("trex", 0, 0);
+            w.u32(t.id);
+            w.u32(1); // default_sample_description_index
+            w.u32(0); // default duration, size and flags: every trun carries its own
+            w.u32(0);
+            w.u32(0);
+            w.end(trex);
+        }
+        w.end(mvex);
+    }
     writeUdta(w, in);
     w.end(moov);
 }
 
-} // namespace
-
-bool writeMp4Clip(const Mp4ClipInput& in, ByteSink& sink) {
-    if (in.videoSamples.empty() || !in.videoSamples.front().keyframe || in.video.fpsNum == 0) return false;
-
+// Track tables for `in`, laid out as in a clip (durations, edit lists); chunks are left empty.
+std::vector<Track> layoutTracks(const Mp4ClipInput& in) {
     std::vector<Track> tracks;
+    tracks.reserve(1 + in.audio.size());
     Track& video = tracks.emplace_back();
     video.video = true;
     video.id = 1;
@@ -394,6 +410,22 @@ bool writeMp4Clip(const Mp4ClipInput& in, ByteSink& sink) {
         t.audio = &a.track;
         layoutAudio(t, a, in.videoSamples.front().time100ns);
     }
+    return tracks;
+}
+
+void putU32(std::vector<uint8_t>& d, size_t at, uint32_t v) {
+    d[at] = static_cast<uint8_t>(v >> 24);
+    d[at + 1] = static_cast<uint8_t>(v >> 16);
+    d[at + 2] = static_cast<uint8_t>(v >> 8);
+    d[at + 3] = static_cast<uint8_t>(v);
+}
+
+} // namespace
+
+bool writeMp4Clip(const Mp4ClipInput& in, ByteSink& sink) {
+    if (in.videoSamples.empty() || !in.videoSamples.front().keyframe || in.video.fpsNum == 0) return false;
+
+    std::vector<Track> tracks = layoutTracks(in);
     for (auto& t : tracks) buildChunks(t);
 
     // Interleave chunks of all tracks by start time.
@@ -444,6 +476,184 @@ bool writeMp4Clip(const Mp4ClipInput& in, ByteSink& sink) {
             if (!sink.write((*t.samples)[i].data)) return false;
     }
     return true;
+}
+
+bool Mp4FragmentedWriter::begin(ByteSink& sink, const Mp4VideoTrack& video, const std::vector<Mp4AudioTrack>& audio,
+                                int64_t videoStart100ns, const std::vector<int64_t>& audioStart100ns, std::string title,
+                                int64_t creationUnixTime) {
+    if (video.fpsNum == 0 || audio.size() != audioStart100ns.size()) return false;
+    tables_ = {};
+    tables_.video = video;
+    tables_.title = std::move(title);
+    tables_.creationUnixTime = creationUnixTime;
+    tables_.audio.resize(audio.size());
+    for (size_t i = 0; i < audio.size(); ++i) tables_.audio[i].track = audio[i];
+    chunks_.assign(1 + audio.size(), {});
+    audioDecodeTime_.assign(audio.size(), 0);
+    retire_.clear();
+    videoStart_ = videoStart100ns;
+    sequence_ = 0;
+
+    // Empty tracks for the fragmented moov; only the audio edit list (pre-roll) is known up front.
+    std::vector<Track> tracks(1 + audio.size());
+    static const std::vector<Mp4Sample> kNone;
+    tracks[0].video = true;
+    tracks[0].id = 1;
+    tracks[0].timescale = videoTimescale(video);
+    tracks[0].samples = &kNone;
+    for (size_t i = 0; i < audio.size(); ++i) {
+        Track& t = tracks[i + 1];
+        t.id = static_cast<uint32_t>(i + 2);
+        t.timescale = audio[i].sampleRate;
+        t.samples = &kNone;
+        t.audio = &tables_.audio[i].track;
+        const int64_t preroll = videoStart100ns - audioStart100ns[i];
+        t.mediaTime = std::max<int64_t>(0, rescale(preroll, 10'000'000, t.timescale)) + audio[i].primingSamples;
+    }
+
+    BoxWriter head;
+    writeFtyp(head, video.codec, true);
+    const uint64_t moovAt = sink.position() + head.size();
+    writeMoov(head, tracks, tables_, true);
+    retire_.push_back(moovAt);
+    return sink.write(head.data());
+}
+
+bool Mp4FragmentedWriter::writeFragment(ByteSink& sink, std::span<const Mp4Sample> video,
+                                        const std::vector<std::span<const Mp4Sample>>& audio) {
+    if (video.empty() && std::ranges::all_of(audio, [](const auto& a) { return a.empty(); })) return true;
+    const uint32_t vts = videoTimescale(tables_.video);
+    const auto nominal = static_cast<uint32_t>(std::max<int64_t>(1, int64_t{vts} * tables_.video.fpsDen / tables_.video.fpsNum));
+
+    struct Run {
+        uint32_t trackId;
+        bool video;
+        uint64_t decodeTime;
+        std::vector<uint32_t> durations;
+        std::span<const Mp4Sample> samples;
+        size_t trunOffsetField = 0;
+        uint64_t bytes = 0;
+    };
+    std::vector<Run> runs;
+    if (!video.empty()) {
+        Run r{1, true, static_cast<uint64_t>(std::max<int64_t>(0, rescale(video.front().time100ns - videoStart_, 10'000'000, vts)))};
+        int64_t prev = static_cast<int64_t>(r.decodeTime);
+        for (size_t i = 1; i < video.size(); ++i) {
+            const int64_t dts = rescale(video[i].time100ns - videoStart_, 10'000'000, vts);
+            r.durations.push_back(static_cast<uint32_t>(std::max<int64_t>(1, dts - prev)));
+            prev = std::max(dts, prev + 1);
+        }
+        r.durations.push_back(nominal);
+        r.samples = video;
+        runs.push_back(std::move(r));
+    }
+    for (size_t i = 0; i < audio.size() && i < tables_.audio.size(); ++i) {
+        if (audio[i].empty()) continue;
+        Run r{static_cast<uint32_t>(i + 2), false, audioDecodeTime_[i]};
+        r.durations.assign(audio[i].size(), kAacFrameSamples);
+        r.samples = audio[i];
+        audioDecodeTime_[i] += uint64_t{kAacFrameSamples} * audio[i].size();
+        runs.push_back(std::move(r));
+    }
+    for (auto& r : runs)
+        for (const auto& s : r.samples) r.bytes += s.data.size();
+
+    BoxWriter moof;
+    const size_t moofBox = moof.begin("moof");
+    const size_t mfhd = moof.beginFull("mfhd", 0, 0);
+    moof.u32(++sequence_);
+    moof.end(mfhd);
+    for (auto& r : runs) {
+        const size_t traf = moof.begin("traf");
+        const size_t tfhd = moof.beginFull("tfhd", 0, 0x020000); // default-base-is-moof
+        moof.u32(r.trackId);
+        moof.end(tfhd);
+        const size_t tfdt = moof.beginFull("tfdt", 1, 0);
+        moof.u64(r.decodeTime);
+        moof.end(tfdt);
+        // data offset | sample duration | sample size [| sample flags]
+        const size_t trun = moof.beginFull("trun", 0, r.video ? 0x000701 : 0x000301);
+        moof.u32(static_cast<uint32_t>(r.samples.size()));
+        r.trunOffsetField = moof.size();
+        moof.u32(0); // patched below
+        for (size_t i = 0; i < r.samples.size(); ++i) {
+            moof.u32(r.durations[i]);
+            moof.u32(static_cast<uint32_t>(r.samples[i].data.size()));
+            // sync: depends on nothing; otherwise depends on others and is not a sync sample
+            if (r.video) moof.u32(r.samples[i].keyframe ? 0x02000000 : 0x01010000);
+        }
+        moof.end(trun);
+        moof.end(traf);
+    }
+    moof.end(moofBox);
+
+    // Runs follow each other in one mdat; offsets are relative to the start of the moof.
+    const uint64_t moofAt = sink.position();
+    uint64_t dataOffset = moof.size() + 8;
+    for (auto& r : runs) {
+        putU32(moof.data(), r.trunOffsetField, static_cast<uint32_t>(dataOffset));
+        auto& chunks = chunks_[r.video ? 0 : r.trackId - 1];
+        auto& table = r.video ? tables_.videoSamples : tables_.audio[r.trackId - 2].samples;
+        chunks.firstSample.push_back(static_cast<uint32_t>(table.size()));
+        chunks.offsets.push_back(moofAt + dataOffset);
+        for (const auto& s : r.samples) table.push_back({{}, s.time100ns, s.keyframe, static_cast<uint32_t>(s.data.size())});
+        dataOffset += r.bytes;
+    }
+
+    uint64_t total = 0;
+    for (const auto& r : runs) total += r.bytes;
+    BoxWriter mdat;
+    mdat.u32(static_cast<uint32_t>(8 + total));
+    mdat.fourcc("mdat");
+    if (!sink.write(moof.data()) || !sink.write(mdat.data())) return false;
+    for (const auto& r : runs)
+        for (const auto& s : r.samples)
+            if (!sink.write(s.data)) return false;
+    retire_.push_back(moofAt);
+    return true;
+}
+
+double Mp4FragmentedWriter::durationSeconds() const {
+    const auto& v = tables_.videoSamples;
+    if (v.empty()) return 0;
+    return (v.back().time100ns - v.front().time100ns) / 1e7 + static_cast<double>(tables_.video.fpsDen) / tables_.video.fpsNum;
+}
+
+bool Mp4FragmentedWriter::finish(const std::filesystem::path& file) {
+    if (tables_.videoSamples.empty() || !tables_.videoSamples.front().keyframe) return false;
+
+    // The complete moov: every sample, with each fragment's run as one chunk.
+    std::vector<Track> tracks = layoutTracks(tables_);
+    for (auto& t : tracks) {
+        size_t index = 0; // chunks_ is indexed like begin(): video, then every audio input
+        for (size_t i = 0; i < tables_.audio.size(); ++i)
+            if (t.audio == &tables_.audio[i].track) index = i + 1;
+        t.chunkFirstSample = chunks_[index].firstSample;
+        t.chunkOffsets = chunks_[index].offsets;
+    }
+    BoxWriter moov;
+    writeMoov(moov, tracks, tables_);
+
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    auto writeAt = [&](uint64_t offset, std::span<const uint8_t> bytes) {
+        LARGE_INTEGER pos{.QuadPart = static_cast<LONGLONG>(offset)};
+        DWORD done = 0;
+        return SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) &&
+               WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &done, nullptr) && done == bytes.size();
+    };
+    LARGE_INTEGER size{};
+    bool ok = GetFileSizeEx(h, &size) && writeAt(static_cast<uint64_t>(size.QuadPart), moov.data());
+    // Only now retire the fragmented boxes: until the new moov is safely written, the file stays a
+    // valid fragmented MP4.
+    static constexpr uint8_t kFree[4] = {'f', 'r', 'e', 'e'};
+    if (ok) ok = FlushFileBuffers(h);
+    for (uint64_t at : retire_)
+        if (ok) ok = writeAt(at + 4, kFree);
+    if (ok) ok = FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok;
 }
 
 } // namespace rec

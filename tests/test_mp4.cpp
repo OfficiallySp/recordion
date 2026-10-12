@@ -166,6 +166,79 @@ TEST_CASE("clip writer produces valid MP4s for every codec, with AAC audio") {
     }
 }
 
+TEST_CASE("hybrid MP4: playable while fragmented, an ordinary MP4 after finish()") {
+    const auto adts = parseAdts(readFile("aac_48k_stereo.adts"));
+    const auto aus = splitAccessUnits(Codec::H264, readFile("h264_202x114.h264"));
+    REQUIRE(aus.size() == 4);
+    const auto config = bs::parseVideoConfig(Codec::H264, aus[0].bytes);
+    REQUIRE(config);
+
+    const int64_t base = 987'654'321;
+    std::vector<std::vector<uint8_t>> videoData(aus.size());
+    std::vector<rec::Mp4Sample> video;
+    for (size_t i = 0; i < aus.size(); ++i) {
+        bs::appendSample(Codec::H264, aus[i].bytes, videoData[i]);
+        video.push_back({videoData[i], base + static_cast<int64_t>(i) * 10'000'000 / 60, aus[i].keyframe});
+    }
+    std::vector<rec::Mp4Sample> audio;
+    const int64_t audioStart = base - 2 * 1024 * 10'000'000LL / 48000; // two frames of pre-roll
+    for (size_t j = 0; j < adts.frames.size(); ++j)
+        audio.push_back({adts.frames[j], audioStart + static_cast<int64_t>(j) * 1024 * 10'000'000 / 48000, true});
+    const rec::Mp4AudioTrack track{.name = "Game", .sampleRate = 48000, .channels = 2, .bitrate = 128000,
+                                   .audioSpecificConfig = adts.asc};
+
+    rec::VectorSink sink;
+    rec::Mp4FragmentedWriter w;
+    REQUIRE(w.begin(sink, {Codec::H264, 202, 114, 60, 1, config->configRecord}, {track}, base, {audioStart},
+                    "Test Game", 1'791'763'200));
+    // Two fragments, each starting on a keyframe; audio split roughly at the same point.
+    const size_t audioSplit = audio.size() / 2;
+    REQUIRE(w.writeFragment(sink, std::span(video).subspan(0, 2), {std::span(audio).subspan(0, audioSplit)}));
+    REQUIRE(w.writeFragment(sink, std::span(video).subspan(2), {std::span(audio).subspan(audioSplit)}));
+    CHECK(topLevelBoxes(sink.data) == std::vector<std::string>{"ftyp", "moov", "moof", "mdat", "moof", "mdat"});
+
+    const auto path = std::filesystem::temp_directory_path() / "recordion_hybrid_test.mp4";
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(sink.data.data()),
+                                                 static_cast<std::streamsize>(sink.data.size()));
+#if defined(RECORDION_FFPROBE) && defined(RECORDION_FFMPEG)
+    auto probe = [&] {
+        return run(std::string("\"\"") + RECORDION_FFPROBE +
+                   "\" -v error -count_frames -show_entries stream=codec_name,nb_read_frames -of compact \"" +
+                   path.string() + "\"\"");
+    };
+    auto decodeErrors = [&] {
+        return run(std::string("\"\"") + RECORDION_FFMPEG + "\" -v error -i \"" + path.string() + "\" -f null -\"");
+    };
+    // As if the recorder had been killed here: still a playable (fragmented) file.
+    std::string p = probe();
+    INFO(p);
+    CHECK(p.find("codec_name=h264|nb_read_frames=4") != std::string::npos);
+    CHECK(p.find("codec_name=aac") != std::string::npos);
+    CHECK(decodeErrors().empty());
+#endif
+
+    REQUIRE(w.finish(path));
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<uint8_t> finished{std::istreambuf_iterator<char>(in), {}};
+    in.close();
+    CHECK(topLevelBoxes(finished) == std::vector<std::string>{"ftyp", "free", "free", "mdat", "free", "mdat", "moov"});
+    CHECK(w.durationSeconds() == doctest::Approx(4.0 / 60).epsilon(0.01));
+#if defined(RECORDION_FFPROBE) && defined(RECORDION_FFMPEG)
+    p = probe();
+    INFO(p);
+    CHECK(p.find("codec_name=h264|nb_read_frames=4") != std::string::npos);
+    CHECK(p.find("codec_name=aac") != std::string::npos);
+    const std::string errors = decodeErrors();
+    CHECK_MESSAGE(errors.empty(), errors);
+    const std::string format = run(std::string("\"\"") + RECORDION_FFPROBE +
+                                   "\" -v error -show_entries format=duration:format_tags=title -of compact \"" +
+                                   path.string() + "\"\"");
+    INFO(format);
+    CHECK(format.find("tag:title=Test Game") != std::string::npos);
+#endif
+    std::filesystem::remove(path);
+}
+
 TEST_CASE("clip writer rejects input that doesn't start with a keyframe") {
     const std::vector<uint8_t> data{0, 0, 0, 1, 0x41};
     rec::Mp4ClipInput in;

@@ -19,6 +19,7 @@ namespace rec {
 inline constexpr uint8_t kVideoTrack = 0; // audio tracks are 1..N
 
 struct BufferedPacket {
+    uint64_t seq = 0;    // append order, across all tracks
     uint64_t offset = 0; // logical byte offset in the arena
     uint32_t size = 0;
     int64_t pts = 0;     // QPC timeline, 100 ns
@@ -45,12 +46,18 @@ public:
         std::filesystem::path diskDirectory; // for BufferStorage::Disk
     };
 
+    // Protects arena bytes from `from` onwards against eviction.
+    struct Pin {
+        uint64_t from = 0;
+        std::atomic<bool> aborted{false};
+    };
+
     class Snapshot {
     public:
         ~Snapshot();
         std::span<const uint8_t> bytes(const BufferedPacket& p) const;
         // True if the buffer had to reclaim this snapshot's space; the data can't be used.
-        bool aborted() const { return aborted_.load(std::memory_order_acquire); }
+        bool aborted() const { return pin_.aborted.load(std::memory_order_acquire); }
 
         std::vector<BufferedPacket> packets; // video and audio, in append order
         uint32_t segment = 0;
@@ -60,8 +67,26 @@ public:
         friend class ReplayBuffer;
         ReplayBuffer* owner_ = nullptr;
         std::shared_ptr<ReplayBuffer> keepAlive_; // a save outlives the session that started it
-        uint64_t pinFrom_ = 0;
-        std::atomic<bool> aborted_{false};
+        Pin pin_;
+    };
+
+    // Streams packets as they arrive (recordings). Everything not yet released stays pinned.
+    class Reader {
+    public:
+        ~Reader();
+        std::span<const uint8_t> bytes(const BufferedPacket& p) const;
+        bool aborted() const { return pin_.aborted.load(std::memory_order_acquire); }
+        int64_t startPts() const { return startPts_; } // the video keyframe the stream starts at
+        uint32_t segment() const { return segment_; }
+
+    private:
+        friend class ReplayBuffer;
+        ReplayBuffer* owner_ = nullptr;
+        std::shared_ptr<ReplayBuffer> keepAlive_;
+        Pin pin_;
+        uint64_t nextSeq_ = 0;
+        int64_t startPts_ = 0;
+        uint32_t segment_ = 0;
     };
 
     ReplayBuffer() = default;
@@ -82,6 +107,14 @@ public:
     std::shared_ptr<Snapshot> snapshot(int64_t from100ns, int64_t to100ns, uint32_t segment = 0,
                                        int64_t audioPreroll100ns = 0);
 
+    // A reader starting at the newest video keyframe at or before `from100ns`, plus audio from
+    // `audioPreroll100ns` before it. nullptr until the first keyframe has been buffered.
+    std::shared_ptr<Reader> openReader(int64_t from100ns, int64_t audioPreroll100ns);
+    // Appends every packet buffered since the previous call.
+    void read(Reader& reader, std::vector<BufferedPacket>& out);
+    // Data before `offset` has been written out and may be evicted.
+    void release(Reader& reader, uint64_t offset);
+
     void setSegmentInfo(uint32_t segment, std::shared_ptr<const SegmentInfo> info);
     std::shared_ptr<const SegmentInfo> segmentInfo(uint32_t segment) const;
 
@@ -98,7 +131,7 @@ public:
     int64_t newestPts(uint8_t track) const;
 
 private:
-    void unpin(Snapshot* s);
+    void unpin(Pin* pin);
     bool evictFor(uint64_t newEnd, int64_t newestPts); // false if pinned data is in the way
     uint8_t* physical(uint64_t logical) const { return arena_ + (logical % capacity_); }
     void releaseArena();
@@ -114,7 +147,8 @@ private:
     uint64_t head_ = 0; // logical offset of the next write
     int64_t newestPts_[4] = {};
     uint32_t newestSegment_ = 0;
-    std::vector<Snapshot*> pins_;
+    std::vector<Pin*> pins_;
+    uint64_t nextSeq_ = 0;
     std::vector<std::pair<uint32_t, std::shared_ptr<const SegmentInfo>>> segments_;
     uint64_t dropped_ = 0;
     uint64_t abortedSnapshots_ = 0;

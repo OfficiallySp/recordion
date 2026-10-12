@@ -28,6 +28,7 @@ struct SaveJob {
 };
 
 struct SaveResult {
+    std::string type = "Replay"; // or "Recording"
     bool ok = false;
     std::filesystem::path path;
     std::string game;

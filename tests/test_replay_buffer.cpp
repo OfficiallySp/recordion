@@ -142,3 +142,55 @@ TEST_CASE("buffer sizing covers the clip, one GOP and headroom") {
     const size_t bytes = rec::replayBufferBytes(120, 2, 75'000, 192);
     CHECK(bytes == (123ull * 75'192 * 1000 / 8) * 5 / 4);
 }
+
+TEST_CASE("reader streams new packets from a keyframe and pins what it hasn't released") {
+    ReplayBuffer b;
+    REQUIRE(b.init(options(1 << 16, 1000))); // 64 KB arena
+    appendVideo(b, 25, 10, 1000);            // keyframes at 0, 10, 20
+    auto reader = b.openReader(15 * kFrame, 0);
+    REQUIRE(reader);
+    CHECK(reader->startPts() == 10 * kFrame);
+
+    std::vector<rec::BufferedPacket> got;
+    b.read(*reader, got);
+    REQUIRE(got.size() == 15);
+    CHECK(got.front().pts == 10 * kFrame);
+    CHECK(reader->bytes(got.front())[0] == 10);
+
+    appendVideo(b, 5, 10, 1000, 1, 25);
+    got.clear();
+    b.read(*reader, got);
+    REQUIRE(got.size() == 5);
+    CHECK(got.front().pts == 25 * kFrame);
+
+    // Unreleased data blocks the producer from wrapping onto it...
+    appendVideo(b, 60, 10, 1000, 1, 30);
+    CHECK(reader->aborted());
+
+    // ...while a reader that releases as it writes never gets in the way.
+    auto r2 = b.openReader(INT64_MAX, 0);
+    REQUIRE(r2);
+    reader.reset();
+    for (int i = 0; i < 200; ++i) {
+        appendVideo(b, 1, 10, 1000, 1, 90 + i);
+        std::vector<rec::BufferedPacket> batch;
+        b.read(*r2, batch);
+        if (!batch.empty()) b.release(*r2, batch.back().offset + batch.back().size);
+    }
+    CHECK_FALSE(r2->aborted());
+}
+
+TEST_CASE("reader includes audio pre-roll that was buffered before the keyframe") {
+    ReplayBuffer b;
+    REQUIRE(b.init(options(1 << 20, 1000)));
+    b.append(1, 8 * kFrame, true, 1, payload(10, 0xA0)); // too early
+    b.append(1, 9 * kFrame, true, 1, payload(10, 0xA1)); // within pre-roll
+    b.append(rec::kVideoTrack, 10 * kFrame, true, 1, payload(10, 0xF0));
+    auto reader = b.openReader(10 * kFrame, kFrame + kFrame / 2);
+    REQUIRE(reader);
+    std::vector<rec::BufferedPacket> got;
+    b.read(*reader, got);
+    REQUIRE(got.size() == 2);
+    CHECK(reader->bytes(got[0])[0] == 0xA1);
+    CHECK(reader->bytes(got[1])[0] == 0xF0);
+}

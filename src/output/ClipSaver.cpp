@@ -7,6 +7,7 @@
 #include "mux/Mp4Writer.h"
 #include "output/AsyncFileWriter.h"
 #include "output/FileNaming.h"
+#include "output/WallClock.h"
 
 namespace rec {
 namespace {
@@ -16,24 +17,6 @@ namespace {
 constexpr int64_t kWaitForEncoders100ns = 4'000'000;
 // Two AAC frames before the first video frame: the decoder needs one to warm up.
 constexpr int64_t kAudioPreroll100ns = 2 * 1024 * 10'000'000LL / 48000;
-
-FILETIME addTicks(FILETIME t, int64_t ticks) {
-    ULARGE_INTEGER u{.LowPart = t.dwLowDateTime, .HighPart = t.dwHighDateTime};
-    u.QuadPart += ticks;
-    return {u.LowPart, u.HighPart};
-}
-
-SYSTEMTIME toLocal(FILETIME utc) {
-    SYSTEMTIME st{}, local{};
-    FileTimeToSystemTime(&utc, &st);
-    SystemTimeToTzSpecificLocalTime(nullptr, &st, &local);
-    return local;
-}
-
-int64_t toUnixSeconds(FILETIME t) {
-    const ULARGE_INTEGER u{.LowPart = t.dwLowDateTime, .HighPart = t.dwHighDateTime};
-    return static_cast<int64_t>(u.QuadPart / 10'000'000) - 11'644'473'600LL;
-}
 
 } // namespace
 
@@ -81,6 +64,7 @@ void ClipSaver::run(std::stop_token stop) {
 
 SaveResult ClipSaver::save(const SaveJob& job) {
     SaveResult r;
+    r.type = job.type;
     r.game = job.game;
     // Frames captured just before the hotkey are still in the encoder: give them a moment.
     const int64_t deadline = clock::now100ns() + kWaitForEncoders100ns;
@@ -116,14 +100,14 @@ SaveResult ClipSaver::save(const SaveJob& job) {
     const int64_t last = clip.videoSamples.back().time100ns;
     r.seconds = clock::toSeconds(last - first) + static_cast<double>(clip.video.fpsDen) / clip.video.fpsNum;
 
-    const FILETIME startWall = addTicks(job.anchorWall, first - job.anchorQpc100ns);
+    const FILETIME startWall = wallclock::fromQpc(first, job.anchorQpc100ns, job.anchorWall);
     clip.title = job.game;
-    clip.creationUnixTime = toUnixSeconds(startWall);
+    clip.creationUnixTime = wallclock::toUnixSeconds(startWall);
 
     NamingContext naming;
     naming.game = job.game;
     naming.type = job.type;
-    naming.localTime = toLocal(startWall);
+    naming.localTime = wallclock::toLocal(startWall);
     naming.durationSeconds = static_cast<int64_t>(r.seconds + 0.5);
     r.path = makeOutputPath(job.root, job.fileTemplate, naming);
 

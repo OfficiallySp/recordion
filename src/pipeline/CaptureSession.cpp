@@ -11,6 +11,7 @@
 #include "encode/AmfEncoder.h"
 #include "mux/Bitstream.h"
 #include "output/ClipSaver.h"
+#include "output/Recorder.h"
 
 #include <winrt/base.h>
 
@@ -309,6 +310,18 @@ void CaptureSession::saveReplay(ClipSaver& saver, uint32_t seconds) const {
     job.game = config_.name;
     job.type = "Replay";
     saver.enqueue(std::move(job));
+}
+
+bool CaptureSession::startRecording(Recorder& recorder, uint32_t prerollSeconds) const {
+    RecordJob job;
+    job.buffer = buffer_;
+    job.anchorQpc100ns = clock::now100ns();
+    GetSystemTimePreciseAsFileTime(&job.anchorWall);
+    job.from100ns = job.anchorQpc100ns - clock::secondsTo100ns(prerollSeconds);
+    job.root = config_.settings.outputRoot();
+    job.fileTemplate = config_.settings.output.fileTemplate;
+    job.game = config_.name;
+    return recorder.start(std::move(job));
 }
 
 SessionStats CaptureSession::stats() const {

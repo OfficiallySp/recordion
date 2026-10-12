@@ -14,6 +14,7 @@ namespace rec {
 
 class CaptureSession;
 class ClipSaver;
+class Recorder;
 
 class App {
 public:
@@ -42,6 +43,9 @@ private:
     void startReplay();
     void stopReplay();
     void saveReplay();
+    bool recording() const;
+    void startRecording();
+    void stopRecording();
     void onSaved(LPARAM result);
     void updateTray();
     void toast(std::wstring_view title, std::wstring_view detail, Notifier::Kind kind);
@@ -56,7 +60,10 @@ private:
     HotkeyManager hotkeys_;
     Notifier notifier_;
     std::unique_ptr<ClipSaver> saver_;
+    std::unique_ptr<Recorder> recorder_;
     std::unique_ptr<CaptureSession> session_;
+    // The session was started only for a recording (instant replay is off): stop it afterwards.
+    bool sessionOnlyForRecording_ = false;
 };
 
 } // namespace rec

@@ -5,7 +5,9 @@
 #include "core/Paths.h"
 #include "core/ThreadQos.h"
 #include "core/Utf.h"
+#include "core/Clock.h"
 #include "output/ClipSaver.h"
+#include "output/Recorder.h"
 #include "pipeline/CaptureSession.h"
 
 #include <shellapi.h>
@@ -57,6 +59,7 @@ int App::run(HINSTANCE instance) {
     tray_.create(hwnd_, kMsgTray, icon_, L"Recordion");
     notifier_.create(instance);
     saver_ = std::make_unique<ClipSaver>(hwnd_, kMsgSaved);
+    recorder_ = std::make_unique<Recorder>(hwnd_, kMsgSaved);
     applyHotkeys();
     log::info("Recordion started; output folder {}", narrow(settings_.outputRoot().wstring()));
     if (settings_.replay.desktopAlwaysOn) startReplay();
@@ -68,6 +71,8 @@ int App::run(HINSTANCE instance) {
         DispatchMessageW(&msg);
     }
 
+    if (recording()) recorder_->stop(clock::now100ns());
+    recorder_.reset(); // finishes the recording's file
     stopReplay();
     saver_.reset(); // finishes the save in progress
     hotkeys_.clear();
@@ -110,6 +115,7 @@ LRESULT App::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case kMsgSession:
         if (session_) {
             const bool failed = wp == kSessionFailed;
+            if (recording()) recorder_->stop(clock::now100ns()); // keeps what was captured
             stopReplay();
             toast(failed ? L"Instant replay stopped" : L"Capture ended",
                   failed ? L"The encoder stopped working. Check the log for details." : L"The captured display went away.",
@@ -163,7 +169,13 @@ void App::onHotkey(HotkeyAction action) {
         saveReplay();
         break;
     case HotkeyAction::ToggleReplayBuffer:
-        if (replayOn()) {
+        if (replayOn() && recording() && !sessionOnlyForRecording_) {
+            sessionOnlyForRecording_ = true; // the recording keeps the capture running until it stops
+            toast(L"Instant replay off", L"Recording continues", Notifier::Kind::Info);
+        } else if (replayOn() && sessionOnlyForRecording_) {
+            sessionOnlyForRecording_ = false; // already capturing for a recording: just keep it
+            toast(L"Instant replay on", L"", Notifier::Kind::Info);
+        } else if (replayOn()) {
             stopReplay();
             toast(L"Instant replay off", L"", Notifier::Kind::Info);
         } else {
@@ -177,9 +189,9 @@ void App::onHotkey(HotkeyAction action) {
         }
         break;
     case HotkeyAction::ToggleRecording:
-    case HotkeyAction::ToggleDesktopRecording:
-        toast(L"Recording isn't available yet", L"Instant replay works now; full recording comes next.",
-              Notifier::Kind::Info);
+    case HotkeyAction::ToggleDesktopRecording: // the same until game sessions exist
+        if (recording()) stopRecording();
+        else startRecording();
         break;
     case HotkeyAction::Count:
         break;
@@ -211,6 +223,26 @@ void App::stopReplay() {
     if (!session_) return;
     session_->stop();
     session_.reset();
+    sessionOnlyForRecording_ = false;
+    updateTray();
+}
+
+bool App::recording() const { return recorder_ && recorder_->active(); }
+
+void App::startRecording() {
+    if (!replayOn()) {
+        startReplay(); // shows its own error toast if capture can't start
+        if (!replayOn()) return;
+        sessionOnlyForRecording_ = true;
+    }
+    if (!session_->startRecording(*recorder_, 0)) return;
+    toast(L"Recording started", std::format(L"Press {} to stop", widen(settings_.hotkeys.toggleRecording)),
+          Notifier::Kind::Info);
+    updateTray();
+}
+
+void App::stopRecording() {
+    recorder_->stop(clock::now100ns()); // the file is finished on the recorder thread; onSaved reports it
     updateTray();
 }
 
@@ -225,12 +257,17 @@ void App::saveReplay() {
 
 void App::onSaved(LPARAM lp) {
     std::unique_ptr<SaveResult> r(reinterpret_cast<SaveResult*>(lp));
-    if (r->ok) {
-        toast(L"Replay saved", std::format(L"{} · {}", widen(r->game), formatClipLength(r->seconds)),
+    const std::wstring what = widen(r->type);
+    if (r->ok && r->error.empty()) {
+        toast(what + L" saved", std::format(L"{} · {}", widen(r->game), formatClipLength(r->seconds)),
               Notifier::Kind::Success);
+    } else if (r->ok) {
+        toast(what + L" saved, but cut short", widen(r->error), Notifier::Kind::Error);
     } else {
-        toast(L"Replay not saved", widen(r->error), Notifier::Kind::Error);
+        toast(what + L" not saved", widen(r->error), Notifier::Kind::Error);
     }
+    if (r->type == "Recording" && !recording() && sessionOnlyForRecording_) stopReplay();
+    updateTray();
 }
 
 void App::toast(std::wstring_view title, std::wstring_view detail, Notifier::Kind kind) {
@@ -238,15 +275,19 @@ void App::toast(std::wstring_view title, std::wstring_view detail, Notifier::Kin
 }
 
 void App::updateTray() {
-    tray_.setTooltip(replayOn() ? L"Recordion – instant replay on" : L"Recordion");
+    tray_.setTooltip(recording()                                  ? L"Recordion – recording"
+                     : replayOn() && !sessionOnlyForRecording_ ? L"Recordion – instant replay on"
+                                                                : L"Recordion");
 }
 
 void App::showTrayMenu() {
-    const bool on = replayOn();
+    const bool on = replayOn() && !sessionOnlyForRecording_;
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (on ? MF_CHECKED : 0), kMenuToggleReplay, L"Instant replay");
     AppendMenuW(menu, MF_STRING | (on ? 0 : MF_GRAYED), kMenuSaveReplay, L"Save replay");
-    AppendMenuW(menu, MF_STRING, kMenuToggleRecording, L"Start recording");
+    const std::wstring recordItem = recording() ? std::format(L"Stop recording ({})", formatClipLength(recorder_->seconds()))
+                                                : std::wstring(L"Start recording");
+    AppendMenuW(menu, MF_STRING, kMenuToggleRecording, recordItem.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuOpenFolder, L"Open videos folder");
     AppendMenuW(menu, MF_STRING, kMenuEditSettings, L"Edit settings file");

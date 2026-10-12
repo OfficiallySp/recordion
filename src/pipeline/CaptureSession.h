@@ -21,6 +21,7 @@
 namespace rec {
 
 class ClipSaver;
+class Recorder;
 
 struct SessionConfig {
     CaptureTarget target;
@@ -63,6 +64,8 @@ public:
 
     // Queues a save of the last `seconds` up to now.
     void saveReplay(ClipSaver& saver, uint32_t seconds) const;
+    // Starts recording from the keyframe at or before `prerollSeconds` ago.
+    bool startRecording(Recorder& recorder, uint32_t prerollSeconds) const;
 
     SessionStats stats() const;
     const SessionConfig& config() const { return config_; }

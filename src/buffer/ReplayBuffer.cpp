@@ -51,10 +51,8 @@ bool ReplayBuffer::init(const Options& o) {
 }
 
 void ReplayBuffer::releaseArena() {
-    for (Snapshot* s : pins_) {
-        s->aborted_.store(true, std::memory_order_release);
-        s->owner_ = nullptr;
-    }
+    // Snapshots and readers keep the buffer alive, so by now no pin is left.
+    for (Pin* p : pins_) p->aborted.store(true, std::memory_order_release);
     pins_.clear();
     packets_.clear();
     head_ = 0;
@@ -74,15 +72,15 @@ void ReplayBuffer::releaseArena() {
 
 void ReplayBuffer::clear() {
     std::scoped_lock lock(mutex_);
-    for (Snapshot* s : pins_) s->aborted_.store(true, std::memory_order_release);
+    for (Pin* p : pins_) p->aborted.store(true, std::memory_order_release);
     packets_.clear();
     std::fill(std::begin(newestPts_), std::end(newestPts_), 0);
 }
 
 bool ReplayBuffer::evictFor(uint64_t newEnd, int64_t newestPts) {
     uint64_t pinFrom = UINT64_MAX;
-    for (const Snapshot* s : pins_)
-        if (!s->aborted()) pinFrom = std::min(pinFrom, s->pinFrom_);
+    for (const Pin* p : pins_)
+        if (!p->aborted.load(std::memory_order_acquire)) pinFrom = std::min(pinFrom, p->from);
 
     while (!packets_.empty()) {
         const BufferedPacket& front = packets_.front();
@@ -110,8 +108,8 @@ void ReplayBuffer::append(uint8_t track, int64_t pts, bool keyframe, uint32_t se
     const int64_t newest = std::max(pts, newestPts_[kVideoTrack]);
     if (!evictFor(offset + data.size(), newest)) {
         // Pinned data is in the way: give the space back by aborting the saves that hold it.
-        for (Snapshot* s : pins_) {
-            if (!s->aborted_.exchange(true)) {
+        for (Pin* p : pins_) {
+            if (!p->aborted.exchange(true)) {
                 ++abortedSnapshots_;
                 log::warn("replay: buffer full while saving; save aborted");
             }
@@ -121,7 +119,7 @@ void ReplayBuffer::append(uint8_t track, int64_t pts, bool keyframe, uint32_t se
     }
 
     std::memcpy(physical(offset), data.data(), data.size());
-    packets_.push_back({offset, static_cast<uint32_t>(data.size()), pts, segment, track, keyframe});
+    packets_.push_back({nextSeq_++, offset, static_cast<uint32_t>(data.size()), pts, segment, track, keyframe});
     head_ = offset + data.size();
     newestPts_[track] = std::max(newestPts_[track], pts);
     newestSegment_ = std::max(newestSegment_, segment);
@@ -155,9 +153,56 @@ std::shared_ptr<ReplayBuffer::Snapshot> ReplayBuffer::snapshot(int64_t from, int
         const int64_t first = p.track == kVideoTrack ? startPts : startPts - audioPreroll;
         if (p.segment == segment && p.pts >= first && p.pts <= to) snap->packets.push_back(p);
     }
-    snap->pinFrom_ = snap->packets.front().offset; // packets_ is in offset order
-    pins_.push_back(snap.get());
+    snap->pin_.from = snap->packets.front().offset; // packets_ is in offset order
+    pins_.push_back(&snap->pin_);
     return snap;
+}
+
+std::shared_ptr<ReplayBuffer::Reader> ReplayBuffer::openReader(int64_t from, int64_t audioPreroll) {
+    std::scoped_lock lock(mutex_);
+    const BufferedPacket* start = nullptr;
+    for (const auto& p : packets_) {
+        if (p.track != kVideoTrack || !p.keyframe || p.segment != newestSegment_) continue;
+        if (p.pts <= from || !start) start = &p;
+        if (p.pts > from) break;
+    }
+    if (!start) return nullptr;
+
+    auto reader = std::shared_ptr<Reader>(new Reader());
+    reader->owner_ = this;
+    reader->keepAlive_ = weak_from_this().lock();
+    reader->startPts_ = start->pts;
+    reader->segment_ = start->segment;
+    reader->nextSeq_ = start->seq;
+    reader->pin_.from = start->offset;
+    // Audio of the pre-roll may have been appended before the keyframe.
+    for (const auto& p : packets_) {
+        if (p.seq >= start->seq) break;
+        if (p.track != kVideoTrack && p.pts >= start->pts - audioPreroll) {
+            reader->nextSeq_ = p.seq;
+            reader->pin_.from = p.offset;
+            break;
+        }
+    }
+    pins_.push_back(&reader->pin_);
+    return reader;
+}
+
+void ReplayBuffer::read(Reader& reader, std::vector<BufferedPacket>& out) {
+    std::scoped_lock lock(mutex_);
+    if (packets_.empty()) return;
+    if (packets_.front().seq > reader.nextSeq_) {
+        reader.pin_.aborted.store(true, std::memory_order_release); // fell behind: data is gone
+        return;
+    }
+    const auto it = std::ranges::lower_bound(packets_, reader.nextSeq_, {}, &BufferedPacket::seq);
+    out.insert(out.end(), it, packets_.end());
+    reader.nextSeq_ = packets_.back().seq + 1;
+}
+
+void ReplayBuffer::release(Reader& reader, uint64_t offset) {
+    std::scoped_lock lock(mutex_);
+    reader.pin_.from = std::max(reader.pin_.from, offset);
 }
 
 void ReplayBuffer::setSegmentInfo(uint32_t segment, std::shared_ptr<const SegmentInfo> info) {
@@ -174,13 +219,22 @@ std::shared_ptr<const SegmentInfo> ReplayBuffer::segmentInfo(uint32_t segment) c
     return nullptr;
 }
 
-void ReplayBuffer::unpin(Snapshot* s) {
+void ReplayBuffer::unpin(Pin* pin) {
     std::scoped_lock lock(mutex_);
-    std::erase(pins_, s);
+    std::erase(pins_, pin);
 }
 
 ReplayBuffer::Snapshot::~Snapshot() {
-    if (owner_) owner_->unpin(this);
+    if (owner_) owner_->unpin(&pin_);
+}
+
+ReplayBuffer::Reader::~Reader() {
+    if (owner_) owner_->unpin(&pin_);
+}
+
+std::span<const uint8_t> ReplayBuffer::Reader::bytes(const BufferedPacket& p) const {
+    if (!owner_) return {};
+    return {owner_->physical(p.offset), p.size};
 }
 
 std::span<const uint8_t> ReplayBuffer::Snapshot::bytes(const BufferedPacket& p) const {
