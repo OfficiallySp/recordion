@@ -93,11 +93,12 @@ add_executable(recordion WIN32
     src/app/Bench.cpp
     src/app/Hotkeys.cpp
     src/app/Notifier.cpp
+    src/app/SettingsWindow.cpp
     src/app/Tray.cpp
     src/app/recordion.rc
     src/app/recordion.manifest
 )
-target_link_libraries(recordion PRIVATE recordion_core psapi d2d1 dwrite winmm shcore)
+target_link_libraries(recordion PRIVATE recordion_core imgui::imgui psapi d2d1 dwrite winmm shcore dwmapi d3d11 dxgi windowscodecs)
 
 enable_testing()
 add_executable(recordion_tests

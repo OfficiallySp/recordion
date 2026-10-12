@@ -2,6 +2,7 @@
 
 #include "app/Hotkeys.h"
 #include "app/Notifier.h"
+#include "app/SettingsWindow.h"
 #include "app/Tray.h"
 #include "core/Settings.h"
 #include "detect/GameDetector.h"
@@ -18,7 +19,7 @@ class CaptureSession;
 class ClipSaver;
 class Recorder;
 
-class App {
+class App final : private SettingsHost {
 public:
     static constexpr const wchar_t* kWindowClass = L"Recordion.MainWindow";
     static constexpr UINT kMsgTray = WM_APP + 1;
@@ -55,10 +56,19 @@ private:
     void onGameEnded(DWORD pid);
     void updateTray();
     void toast(std::wstring_view title, std::wstring_view detail, Notifier::Kind kind);
+    void applyStartWithWindows();
+
+    // SettingsHost
+    const Settings& currentSettings() const override { return settings_; }
+    std::string applySettings(const Settings& settings) override;
+    void suspendHotkeys(bool suspend) override;
+    std::vector<std::string> statusLines() const override;
+    std::vector<std::string> availableEncoders() const override;
 
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
     HICON icon_ = nullptr;
+    HICON bigIcon_ = nullptr;
     UINT taskbarCreatedMsg_ = 0;
     std::filesystem::path settingsFile_;
     Settings settings_;
@@ -70,6 +80,7 @@ private:
     std::unique_ptr<CaptureSession> session_;
     std::unique_ptr<GameDetector> detector_;
     std::optional<DetectedGame> game_; // the game being played, if any
+    SettingsWindow settingsWindow_{*this};
     // The session was started only for a recording (instant replay is off): stop it afterwards.
     bool sessionOnlyForRecording_ = false;
 };

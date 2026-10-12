@@ -5,6 +5,7 @@
 #include "core/Paths.h"
 #include "core/ThreadQos.h"
 #include "core/Utf.h"
+#include "encode/AmfEncoder.h"
 #include "core/Clock.h"
 #include "output/ClipSaver.h"
 #include "output/Recorder.h"
@@ -18,6 +19,7 @@ namespace rec {
 namespace {
 
 enum MenuId : UINT {
+    kMenuSettings = 99,
     kMenuToggleReplay = 100,
     kMenuSaveReplay,
     kMenuToggleRecording,
@@ -56,7 +58,10 @@ int App::run(HINSTANCE instance) {
     taskbarCreatedMsg_ = RegisterWindowMessageW(L"TaskbarCreated");
     icon_ = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                           GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    bigIcon_ = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
+                                             GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
     tray_.create(hwnd_, kMsgTray, icon_, L"Recordion");
+    applyStartWithWindows();
     notifier_.create(instance);
     saver_ = std::make_unique<ClipSaver>(hwnd_, kMsgSaved);
     recorder_ = std::make_unique<Recorder>(hwnd_, kMsgSaved);
@@ -79,8 +84,10 @@ int App::run(HINSTANCE instance) {
     stopReplay();
     saver_.reset(); // finishes the save in progress
     hotkeys_.clear();
+    settingsWindow_.close();
     tray_.destroy();
     if (icon_) DestroyIcon(icon_);
+    if (bigIcon_) DestroyIcon(bigIcon_);
     log::info("Recordion exited");
     return static_cast<int>(msg.wParam);
 }
@@ -106,11 +113,12 @@ LRESULT App::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         if (auto action = hotkeys_.actionFromId(wp)) onHotkey(*action);
         return 0;
     case kMsgTray:
-        // NOTIFYICON_VERSION_4: LOWORD(lp) is the event.
-        if (LOWORD(lp) == WM_CONTEXTMENU || LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == NIN_SELECT) showTrayMenu();
+        // NOTIFYICON_VERSION_4: LOWORD(lp) is the event. Left click opens settings, right click the menu.
+        if (LOWORD(lp) == WM_CONTEXTMENU) showTrayMenu();
+        else if (LOWORD(lp) == NIN_SELECT || LOWORD(lp) == NIN_KEYSELECT) settingsWindow_.show(instance_, bigIcon_);
         return 0;
-    case kMsgActivate:
-        showTrayMenu();
+    case kMsgActivate: // launched again while running: show the settings
+        settingsWindow_.show(instance_, bigIcon_);
         return 0;
     case kMsgSaved:
         onSaved(lp);
@@ -136,6 +144,7 @@ LRESULT App::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         case kMenuToggleReplay: onHotkey(HotkeyAction::ToggleReplayBuffer); break;
         case kMenuSaveReplay: onHotkey(HotkeyAction::SaveReplay); break;
         case kMenuToggleRecording: onHotkey(HotkeyAction::ToggleRecording); break;
+        case kMenuSettings: settingsWindow_.show(instance_, bigIcon_); break;
         case kMenuOpenFolder: openOutputFolder(); break;
         case kMenuEditSettings: editSettingsFile(); break;
         case kMenuReloadSettings: {
@@ -343,6 +352,7 @@ void App::showTrayMenu() {
                                                 : std::wstring(L"Start recording");
     AppendMenuW(menu, MF_STRING, kMenuToggleRecording, recordItem.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kMenuSettings, L"Settings...");
     AppendMenuW(menu, MF_STRING, kMenuOpenFolder, L"Open videos folder");
     AppendMenuW(menu, MF_STRING, kMenuEditSettings, L"Edit settings file");
     AppendMenuW(menu, MF_STRING, kMenuReloadSettings, L"Reload settings");
@@ -362,6 +372,92 @@ void App::openOutputFolder() {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void App::applyStartWithWindows() {
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+    if (settings_.general.startWithWindows) {
+        const std::wstring command = L"\"" + paths::executablePath().wstring() + L"\"";
+        RegSetValueExW(key, L"Recordion", 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()),
+                       static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(key, L"Recordion");
+    }
+    RegCloseKey(key);
+}
+
+std::string App::applySettings(const Settings& s) {
+    const auto sessionPart = [](const Settings& x) {
+        // What a running capture session was built from.
+        Settings only;
+        only.video = x.video;
+        only.audio = x.audio;
+        only.capture = x.capture;
+        only.replay.seconds = x.replay.seconds;
+        only.replay.storage = x.replay.storage;
+        return only.toJson();
+    };
+    const bool sessionChanged = sessionPart(s) != sessionPart(settings_);
+    settings_ = s;
+    std::string message = settings_.save(settingsFile_) ? "Saved." : "Couldn't write the settings file.";
+    applyHotkeys();
+    detector_->setSettings(settings_.detection);
+    applyStartWithWindows();
+
+    if (sessionChanged && session_) {
+        if (recording()) {
+            message += " Video and audio changes apply after the current recording.";
+        } else {
+            const bool onlyForRecording = sessionOnlyForRecording_;
+            stopReplay();
+            if (!onlyForRecording) startReplay();
+            message += " Capture restarted with the new settings.";
+        }
+    } else if (!session_ && !game_ && settings_.replay.desktopAlwaysOn) {
+        startReplay();
+    } else if (session_ && !game_ && !settings_.replay.desktopAlwaysOn && !recording() && !sessionOnlyForRecording_) {
+        // Desktop replay was switched off (it may also have been turned on by hand; keep it simple).
+    }
+    updateTray();
+    return message;
+}
+
+void App::suspendHotkeys(bool suspend) {
+    if (suspend) hotkeys_.clear();
+    else applyHotkeys();
+}
+
+std::vector<std::string> App::statusLines() const {
+    std::vector<std::string> lines;
+    lines.push_back(game_ ? std::format("Game: {}", game_->name) : std::string("No game detected"));
+    if (!session_ || !session_->running()) {
+        lines.push_back("Not capturing.");
+        return lines;
+    }
+    const auto st = session_->stats();
+    const auto& v = session_->config().settings.video;
+    const char* codec = v.codec == Codec::H264 ? "H.264" : v.codec == Codec::HEVC ? "HEVC" : "AV1";
+    lines.push_back(std::format("Capturing \"{}\" at {}x{}, {} fps, {}{}", session_->config().name, st.outputSize.width,
+                                st.outputSize.height, v.fps, codec, v.tenBit ? " 10-bit" : ""));
+    lines.push_back(std::format("Path: {}", st.zeroCopy ? "zero-copy (capture goes straight to the encoder)"
+                                                       : "video processor (scaling or colour conversion)"));
+    lines.push_back(std::format("Frames: {} captured, {} encoded, {} repeated, {} dropped", st.framesCaptured,
+                                st.framesEncoded, st.duplicates, st.droppedBusy + st.encodeErrors));
+    const double held = st.buffer.oldestVideoKeyframePts ? (st.buffer.newestPts[0] - st.buffer.oldestVideoKeyframePts) / 1e7 : 0;
+    lines.push_back(std::format("Replay buffer: {:.0f} s held, {:.0f} of {:.0f} MB", held, st.buffer.usedBytes / 1048576.0,
+                                st.buffer.capacityBytes / 1048576.0));
+    lines.push_back(std::format("Audio tracks: {}", st.audioTracks));
+    if (recording()) lines.push_back(std::format("Recording: {:.0f} s", recorder_->seconds()));
+    return lines;
+}
+
+std::vector<std::string> App::availableEncoders() const {
+    std::vector<std::string> out;
+    if (AmfEncoder::runtimeAvailable()) out.emplace_back("AMD (AMF)");
+    return out;
 }
 
 void App::editSettingsFile() {

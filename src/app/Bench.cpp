@@ -7,6 +7,7 @@
 #include "core/Log.h"
 #include "core/ThreadQos.h"
 #include "core/Utf.h"
+#include "app/SettingsWindow.h"
 #include "detect/GameLibrary.h"
 #include "encode/AmfEncoder.h"
 #include "gpu/ColorConverter.h"
@@ -358,6 +359,24 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
 } // namespace
 
 int runBench(const std::vector<std::wstring>& args) {
+    if (args.size() >= 3 && args[1] == L"--settings-screenshots") {
+        // Renders every settings page to PNGs, to check the layout without a display.
+        struct Host final : SettingsHost {
+            Settings s;
+            const Settings& currentSettings() const override { return s; }
+            std::string applySettings(const Settings&) override { return {}; }
+            void suspendHotkeys(bool) override {}
+            std::vector<std::string> statusLines() const override {
+                return {"Game: Haste", "Capturing \"Haste\" at 1920x1080, 60 fps, HEVC", "Path: zero-copy"};
+            }
+            std::vector<std::string> availableEncoders() const override { return {"AMD (AMF)"}; }
+        } host;
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
+        SettingsWindow window(host);
+        const bool ok = window.screenshotPages(GetModuleHandleW(nullptr), args[2]);
+        std::println("{}", ok ? "wrote settings-*.png" : "failed");
+        return ok ? 0 : 1;
+    }
     if (args.size() >= 2 && args[1] == L"--games") {
         GameLibrary lib;
         lib.build();
