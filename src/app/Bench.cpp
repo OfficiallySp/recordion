@@ -61,13 +61,146 @@ struct BenchOptions {
     std::wstring outDir;
     DWORD pid = 0; // session mode: capture only this process's audio
     double recordSeconds = 0; // session mode: also make a manual recording this long
+    // Encoder tuning (encode mode).
+    RateControl rateControl = RateControl::VBR;
+    uint32_t peakKbps = 0; // 0 = 1.5x the bitrate
+    uint32_t cqLevel = 23;
+    uint32_t gopSeconds = 2;
+    // Quality testing: grab real frames once, then encode exactly those frames with every setting.
+    std::wstring grabRaw;   // write this many captured frames, uncompressed BGRA, to this file
+    uint32_t frames = 0;
+    std::wstring sourceRaw; // read frames from such a file instead of capturing
+    Size sourceSize{};
 };
 
 void usage() {
     std::println("usage: recordion --bench [--seconds N] [--fps N] [--height N] [--10bit] [--no-cursor] [--monitor N]\n"
                  "                         [--codec h264|hevc|av1 [--bitrate KBPS] [--preset speed|balanced|quality]\n"
-                 "                          [--out file.mp4]]\n"
-                 "                         [--dump-frame file.yuv]");
+                 "                          [--rc vbr|cbr|cqp] [--peak KBPS] [--cq N] [--gop SECONDS] [--out file.mp4]]\n"
+                 "                         [--dump-frame file.yuv]\n"
+                 "                         [--source-raw file.bgra --source-size WxH]  (encode grabbed frames)\n"
+                 "       recordion --bench --grab-raw file.bgra --frames N [--fps N] [--monitor N]");
+}
+
+// Replays frames saved by --grab-raw (tightly packed BGRA, no header) once, at the bench's pace, so
+// every encoder setting sees exactly the same real game frames.
+class RawFileSource final : public ICaptureSource {
+public:
+    RawFileSource(const GpuDevice& gpu, std::wstring path, Size size)
+        : device_(gpu.device), context_(gpu.context), path_(std::move(path)), size_(size) {}
+    ~RawFileSource() override { stop(); }
+
+    const char* name() const override { return "raw file"; }
+    bool start() override {
+        file_ = CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
+                            nullptr);
+        LARGE_INTEGER bytes{};
+        frameBytes_ = size_t{size_.width} * size_.height * 4;
+        if (file_ == INVALID_HANDLE_VALUE || frameBytes_ == 0 || !GetFileSizeEx(file_, &bytes)) return false;
+        count_ = static_cast<uint64_t>(bytes.QuadPart) / frameBytes_;
+        mapping_ = CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        data_ = mapping_ ? static_cast<const uint8_t*>(MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0)) : nullptr;
+        if (!data_ || count_ == 0) return false;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = size_.width;
+        td.Height = size_.height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        for (auto& t : textures_)
+            if (FAILED(device_->CreateTexture2D(&td, nullptr, t.put()))) return false;
+        log::info("raw source: {} frames of {}x{}", count_, size_.width, size_.height);
+        return true;
+    }
+    void stop() override {
+        if (data_) UnmapViewOfFile(data_);
+        if (mapping_) CloseHandle(mapping_);
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+        data_ = nullptr;
+        mapping_ = nullptr;
+        file_ = INVALID_HANDLE_VALUE;
+    }
+    std::optional<CapturedFrame> acquireLatest() override {
+        if (next_ >= count_) return std::nullopt;
+        auto& texture = textures_[next_ % textures_.size()];
+        context_->UpdateSubresource(texture.get(), 0, nullptr, data_ + next_ * frameBytes_, size_.width * 4, 0);
+        CapturedFrame f;
+        f.texture = texture;
+        f.width = size_.width;
+        f.height = size_.height;
+        f.time100ns = clock::now100ns();
+        f.sequence = ++next_;
+        return f;
+    }
+    bool targetLost() const override { return next_ >= count_; }
+    uint64_t framesArrived() const override { return next_; }
+
+private:
+    winrt::com_ptr<ID3D11Device5> device_;
+    winrt::com_ptr<ID3D11DeviceContext4> context_;
+    std::wstring path_;
+    Size size_;
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    HANDLE mapping_ = nullptr;
+    const uint8_t* data_ = nullptr;
+    size_t frameBytes_ = 0;
+    uint64_t count_ = 0;
+    uint64_t next_ = 0;
+    std::array<winrt::com_ptr<ID3D11Texture2D>, 8> textures_; // deep enough for frames still in the encoder
+};
+
+// Saves `frames` consecutive new frames from the screen, uncompressed, for --source-raw. They are
+// kept in RAM while grabbing (a disk can't take 500 MB/s steadily) and written at the end.
+int runGrab(const BenchOptions& o, HMONITOR monitor) {
+    auto gpu = createGpuDevice({.monitor = monitor, .highGpuPriority = true});
+    if (!gpu || o.frames == 0) return 1;
+    WgcCapture capture(*gpu, CaptureTarget{.monitor = monitor}, CaptureOptions{.fps = o.fps, .cursor = o.cursor});
+    if (!capture.start()) return 1;
+    winrt::com_ptr<ID3D11Texture2D> staging;
+    std::vector<uint8_t> data;
+    Size size{};
+    uint64_t grabbed = 0, idleTicks = 0;
+    FrameTimer timer(o.fps);
+    while (grabbed < o.frames && timer.waitNext()) {
+        auto frame = capture.acquireLatest();
+        if (!frame) {
+            ++idleTicks; // nothing new on screen: not part of the sequence
+            continue;
+        }
+        if (!staging) {
+            size = {frame->width, frame->height};
+            D3D11_TEXTURE2D_DESC d{};
+            frame->texture->GetDesc(&d);
+            d.Width = size.width;
+            d.Height = size.height;
+            d.Usage = D3D11_USAGE_STAGING;
+            d.BindFlags = 0;
+            d.MiscFlags = 0;
+            d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(gpu->device->CreateTexture2D(&d, nullptr, staging.put()))) return 1;
+            data.resize(size_t{o.frames} * size.width * size.height * 4);
+        }
+        const D3D11_BOX box{0, 0, 0, size.width, size.height, 1};
+        gpu->context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, frame->texture.get(), 0, &box);
+        frame.reset();
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(gpu->context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) return 1;
+        uint8_t* out = data.data() + grabbed * size.width * size.height * 4;
+        for (uint32_t y = 0; y < size.height; ++y)
+            std::memcpy(out + size_t{y} * size.width * 4, static_cast<const uint8_t*>(m.pData) + size_t{y} * m.RowPitch,
+                        size_t{size.width} * 4);
+        gpu->context->Unmap(staging.get(), 0);
+        ++grabbed;
+    }
+    capture.stop();
+    std::ofstream file(o.grabRaw, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(grabbed * size.width * size.height * 4));
+    std::println("grabbed {} frames of {}x{} ({} ticks with nothing new, {} timer ticks skipped) to {}", grabbed,
+                 size.width, size.height, idleTicks, timer.skippedTicks(), narrow(o.grabRaw));
+    return file ? 0 : 1;
 }
 
 bool parse(const std::vector<std::wstring>& args, BenchOptions& o) {
@@ -97,6 +230,23 @@ bool parse(const std::vector<std::wstring>& args, BenchOptions& o) {
         else if (a == L"--out-dir") o.outDir = *v;
         else if (a == L"--pid") o.pid = static_cast<DWORD>(std::stoul(*v));
         else if (a == L"--record") o.recordSeconds = std::stod(*v);
+        else if (a == L"--peak") o.peakKbps = static_cast<uint32_t>(std::stoul(*v));
+        else if (a == L"--cq") o.cqLevel = static_cast<uint32_t>(std::stoul(*v));
+        else if (a == L"--gop") o.gopSeconds = static_cast<uint32_t>(std::stoul(*v));
+        else if (a == L"--grab-raw") o.grabRaw = *v;
+        else if (a == L"--frames") o.frames = static_cast<uint32_t>(std::stoul(*v));
+        else if (a == L"--source-raw") o.sourceRaw = *v;
+        else if (a == L"--source-size") {
+            const auto x = v->find(L'x');
+            if (x == std::wstring::npos) return false;
+            o.sourceSize = {static_cast<uint32_t>(std::stoul(v->substr(0, x))), static_cast<uint32_t>(std::stoul(v->substr(x + 1)))};
+        }
+        else if (a == L"--rc") {
+            if (*v == L"vbr") o.rateControl = RateControl::VBR;
+            else if (*v == L"cbr") o.rateControl = RateControl::CBR;
+            else if (*v == L"cqp") o.rateControl = RateControl::CQP;
+            else return false;
+        }
         else if (a == L"--synthetic-size") {
             const auto x = v->find(L'x');
             if (x == std::wstring::npos) return false;
@@ -476,6 +626,7 @@ int runBench(const std::vector<std::wstring>& args) {
     qos::MmcssScope mmcss(L"Capture");
 
     const HMONITOR monitor = monitorByIndex(o.monitorIndex);
+    if (!o.grabRaw.empty()) return runGrab(o, monitor);
     if (o.session) return runSessionBench(o, monitor);
     if (o.captureOnly) return runCaptureOnly(o, monitor, o.amdCapture);
     auto gpu = createGpuDevice({.monitor = monitor, .highGpuPriority = true});
@@ -486,7 +637,8 @@ int runBench(const std::vector<std::wstring>& args) {
     std::println("GPU: {} ({})", gpu->adapterName, gpuVendorName(gpu->vendor));
 
     std::unique_ptr<ICaptureSource> source;
-    if (o.synthetic.width) source = std::make_unique<FakeCapture>(*gpu, o.synthetic.width, o.synthetic.height);
+    if (!o.sourceRaw.empty()) source = std::make_unique<RawFileSource>(*gpu, o.sourceRaw, o.sourceSize);
+    else if (o.synthetic.width) source = std::make_unique<FakeCapture>(*gpu, o.synthetic.width, o.synthetic.height);
     else source = std::make_unique<WgcCapture>(*gpu, CaptureTarget{.monitor = monitor}, CaptureOptions{.fps = o.fps, .cursor = o.cursor});
     ICaptureSource& capture = *source;
     if (!capture.start()) {
@@ -523,6 +675,7 @@ int runBench(const std::vector<std::wstring>& args) {
             SectionScope _(secAcquire);
             frame = capture.acquireLatest();
         }
+        if (!frame && capture.targetLost()) break; // a raw file has run out
         if (!frame) {
             ++duplicates;
             if (encoder && lastSurface) {
@@ -545,8 +698,10 @@ int runBench(const std::vector<std::wstring>& args) {
                     }
                     EncoderConfig ec{.codec = *o.codec, .tenBit = o.tenBit, .width = outSize.width,
                                      .height = outSize.height, .fpsNum = o.fps, .fpsDen = 1,
-                                     .bitrateKbps = o.bitrateKbps, .maxBitrateKbps = o.bitrateKbps * 3 / 2,
-                                     .gopFrames = o.fps * 2, .preset = o.preset, .rgbInput = o.rgbInput};
+                                     .rateControl = o.rateControl, .bitrateKbps = o.bitrateKbps,
+                                     .maxBitrateKbps = o.peakKbps ? o.peakKbps : o.bitrateKbps * 3 / 2,
+                                     .cqLevel = o.cqLevel, .gopFrames = o.fps * o.gopSeconds, .preset = o.preset,
+                                     .rgbInput = o.rgbInput};
                     if (o.rgbInput && outSize != Size{frame->width, frame->height}) {
                         std::println("error: --rgb-input needs output size == capture size");
                         return 1;

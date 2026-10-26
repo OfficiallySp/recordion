@@ -582,10 +582,11 @@ void SettingsWindow::drawVideo() {
     comboEnum("Capture method", c.method,
               {{CaptureMethod::Auto, "Windows Graphics Capture"}, {CaptureMethod::AmdDirect, "AMD Direct Capture (experimental)"}});
     if (c.method == CaptureMethod::AmdDirect)
-        hint("Takes frames straight from the AMD display driver, so Windows' compositor does no work for the "
-             "recording. In games it can be slightly cheaper (measured ~0.6% vs ~1% of the 3D engine); on a still "
-             "desktop it costs more, because it copies every frame. Whole displays only, no mouse cursor. "
-             "Falls back to Windows Graphics Capture on other GPUs.");
+        hint("Takes frames straight from the AMD display driver instead of through Windows' compositor. In a "
+             "GPU-heavy game on a Radeon 8060S it cost the game more than Windows Graphics Capture (about 2% of the "
+             "3D engine vs under 1%), and it hands over every frame whether or not anything changed, so the encoder "
+             "can't skip unchanged ones. Whole displays only, no mouse cursor. Falls back to Windows Graphics "
+             "Capture on other GPUs.");
     ImGui::Checkbox("Include the mouse cursor", &c.captureCursor);
 }
 

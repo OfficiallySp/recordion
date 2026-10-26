@@ -11,9 +11,10 @@
 namespace rec {
 
 // AMD Direct Capture: the display driver hands over the frame being scanned out, through AMF's
-// DisplayCapture component. Unlike Windows.Graphics.Capture, DWM does no work for it (measured:
-// ~0.3% 3D load instead of ~1%), so a fullscreen game keeps its fastest present path. Monitors
-// only, and the hardware cursor is not part of the image. AMD GPUs only; experimental.
+// DisplayCapture component. DWM does no work for it, but in a GPU-bound game on a Radeon 8060S it
+// still cost the game more 3D time than Windows.Graphics.Capture (~2.3 vs ~0.7 points), and it
+// returns a frame every tick, so unchanged frames can't be skipped. Monitors only, and the hardware
+// cursor is not part of the image. AMD GPUs only; experimental.
 class AmdDirectCapture final : public ICaptureSource {
 public:
     AmdDirectCapture(const GpuDevice& gpu, HMONITOR monitor);
