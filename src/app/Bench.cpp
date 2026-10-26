@@ -71,6 +71,8 @@ struct BenchOptions {
     uint32_t frames = 0;
     std::wstring sourceRaw; // read frames from such a file instead of capturing
     Size sourceSize{};
+    uint32_t every = 1;     // a new raw frame only every Nth tick, like a game running below the frame rate
+    bool skipUnchanged = false; // ticks without a new frame aren't encoded (as CaptureSession does by default)
 };
 
 void usage() {
@@ -86,8 +88,8 @@ void usage() {
 // every encoder setting sees exactly the same real game frames.
 class RawFileSource final : public ICaptureSource {
 public:
-    RawFileSource(const GpuDevice& gpu, std::wstring path, Size size)
-        : device_(gpu.device), context_(gpu.context), path_(std::move(path)), size_(size) {}
+    RawFileSource(const GpuDevice& gpu, std::wstring path, Size size, uint32_t every)
+        : device_(gpu.device), context_(gpu.context), path_(std::move(path)), size_(size), every_(every) {}
     ~RawFileSource() override { stop(); }
 
     const char* name() const override { return "raw file"; }
@@ -124,7 +126,7 @@ public:
         file_ = INVALID_HANDLE_VALUE;
     }
     std::optional<CapturedFrame> acquireLatest() override {
-        if (next_ >= count_) return std::nullopt;
+        if (next_ >= count_ || calls_++ % every_ != 0) return std::nullopt;
         auto& texture = textures_[next_ % textures_.size()];
         context_->UpdateSubresource(texture.get(), 0, nullptr, data_ + next_ * frameBytes_, size_.width * 4, 0);
         CapturedFrame f;
@@ -149,6 +151,8 @@ private:
     size_t frameBytes_ = 0;
     uint64_t count_ = 0;
     uint64_t next_ = 0;
+    uint32_t every_ = 1;
+    uint64_t calls_ = 0;
     std::array<winrt::com_ptr<ID3D11Texture2D>, 8> textures_; // deep enough for frames still in the encoder
 };
 
@@ -214,6 +218,7 @@ bool parse(const std::vector<std::wstring>& args, BenchOptions& o) {
         if (a == L"--rgb-input") { o.rgbInput = true; continue; }
         if (a == L"--session") { o.session = true; continue; }
         if (a == L"--cfr") { o.constantFrameRate = true; continue; }
+        if (a == L"--skip-unchanged") { o.skipUnchanged = true; continue; }
         if (a == L"--video-processor") { o.forceVideoProcessor = true; continue; }
         if (a == L"--capture-only") { o.captureOnly = true; continue; }
         if (a == L"--amd-capture") { o.captureOnly = o.amdCapture = true; continue; }
@@ -236,6 +241,7 @@ bool parse(const std::vector<std::wstring>& args, BenchOptions& o) {
         else if (a == L"--grab-raw") o.grabRaw = *v;
         else if (a == L"--frames") o.frames = static_cast<uint32_t>(std::stoul(*v));
         else if (a == L"--source-raw") o.sourceRaw = *v;
+        else if (a == L"--every") o.every = std::max(1u, static_cast<uint32_t>(std::stoul(*v)));
         else if (a == L"--source-size") {
             const auto x = v->find(L'x');
             if (x == std::wstring::npos) return false;
@@ -637,7 +643,7 @@ int runBench(const std::vector<std::wstring>& args) {
     std::println("GPU: {} ({})", gpu->adapterName, gpuVendorName(gpu->vendor));
 
     std::unique_ptr<ICaptureSource> source;
-    if (!o.sourceRaw.empty()) source = std::make_unique<RawFileSource>(*gpu, o.sourceRaw, o.sourceSize);
+    if (!o.sourceRaw.empty()) source = std::make_unique<RawFileSource>(*gpu, o.sourceRaw, o.sourceSize, o.every);
     else if (o.synthetic.width) source = std::make_unique<FakeCapture>(*gpu, o.synthetic.width, o.synthetic.height);
     else source = std::make_unique<WgcCapture>(*gpu, CaptureTarget{.monitor = monitor}, CaptureOptions{.fps = o.fps, .cursor = o.cursor});
     ICaptureSource& capture = *source;
@@ -678,7 +684,7 @@ int runBench(const std::vector<std::wstring>& args) {
         if (!frame && capture.targetLost()) break; // a raw file has run out
         if (!frame) {
             ++duplicates;
-            if (encoder && lastSurface) {
+            if (encoder && lastSurface && !o.skipUnchanged) {
                 sink->submitted(pts);
                 if (!encoder->encode(*lastSurface, pts, kFrameDuplicate)) ++encodeErrors;
             }
