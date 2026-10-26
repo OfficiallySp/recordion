@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(recordion VERSION 1.1.0 LANGUAGES CXX RC)
+project(recordion VERSION 1.1.1 LANGUAGES CXX RC)
 
 if(NOT MSVC)
     message(FATAL_ERROR "Recordion targets Windows with MSVC only")
