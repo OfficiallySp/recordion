@@ -130,6 +130,9 @@ public:
     };
     Stats stats() const;
     int64_t newestPts(uint8_t track) const;
+    // The video track is complete up to `pts` although no packet was appended: nothing changed on
+    // screen, so the last frame still holds. Lets saves stop waiting for video that won't come.
+    void advanceVideoClock(int64_t pts);
 
 private:
     void unpin(Pin* pin);

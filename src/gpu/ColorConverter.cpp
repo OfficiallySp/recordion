@@ -32,6 +32,7 @@ bool VideoProcessorConverter::init(ID3D11Device* device, ID3D11DeviceContext* co
                                    DXGI_FORMAT outputFormat, uint32_t fps) {
     reset();
     if (!device || !context) return false;
+    context_.copy_from(context);
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(videoDevice_.put()))) ||
         FAILED(context->QueryInterface(IID_PPV_ARGS(videoContext_.put())))) {
         log::error("convert: device has no video support");
@@ -89,9 +90,12 @@ bool VideoProcessorConverter::init(ID3D11Device* device, ID3D11DeviceContext* co
 void VideoProcessorConverter::reset() {
     inputViews_.clear();
     outputViews_.clear();
+    copyView_ = nullptr;
+    copy_ = nullptr;
     processor_ = nullptr;
     enumerator_ = nullptr;
     videoContext_ = nullptr;
+    context_ = nullptr;
     videoDevice_ = nullptr;
     input_ = output_ = lastContent_ = {};
 }
@@ -106,6 +110,31 @@ ID3D11VideoProcessorInputView* VideoProcessorConverter::inputView(ID3D11Texture2
     inputViews_.emplace_back(texture, view);
     trimCache(inputViews_);
     return view.get();
+}
+
+ID3D11VideoProcessorInputView* VideoProcessorConverter::copiedInputView(ID3D11Texture2D* texture) {
+    if (!copy_) {
+        D3D11_TEXTURE2D_DESC td{};
+        texture->GetDesc(&td);
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = 0;
+        winrt::com_ptr<ID3D11Device> device;
+        context_->GetDevice(device.put());
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC desc{};
+        desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        if (FAILED(device->CreateTexture2D(&td, nullptr, copy_.put())) ||
+            FAILED(videoDevice_->CreateVideoProcessorInputView(copy_.get(), enumerator_.get(), &desc, copyView_.put()))) {
+            log::error("convert: the video processor can't read the captured frames");
+            copy_ = nullptr;
+            copyView_ = nullptr;
+            return nullptr;
+        }
+        log::info("convert: the captured frames can't be read directly; copying each one first");
+    }
+    context_->CopyResource(copy_.get(), texture);
+    return copyView_.get();
 }
 
 ID3D11VideoProcessorOutputView* VideoProcessorConverter::outputView(ID3D11Texture2D* texture, UINT slice) {
@@ -149,7 +178,8 @@ bool VideoProcessorConverter::convert(ID3D11Texture2D* input, Size content, ID3D
         lastContent_ = content;
     }
 
-    auto* in = inputView(input);
+    auto* in = copy_ ? nullptr : inputView(input);
+    if (!in) in = copiedInputView(input);
     auto* out = outputView(output, outputArraySlice);
     if (!in || !out) return false;
 

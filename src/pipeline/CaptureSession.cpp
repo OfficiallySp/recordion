@@ -186,7 +186,9 @@ bool CaptureSession::configureEncoder(Size captureSize, Size textureSize) {
                      .bitrateKbps = s.video.bitrateKbps,
                      .maxBitrateKbps = s.video.maxBitrateKbps,
                      .cqLevel = s.video.cqLevel,
-                     .gopFrames = s.video.fps * std::max(1u, s.video.gopSeconds),
+                     // tick() forces keyframes by the clock; the encoder's own interval is only a
+                     // backstop. Counted in frames, it would stretch whenever unchanged frames are skipped.
+                     .gopFrames = s.video.fps * std::max(1u, s.video.gopSeconds) * 4,
                      .preset = s.video.preset};
 
     // Zero-copy when nothing needs scaling and the encoder converts RGB in fixed-function hardware:
@@ -218,6 +220,10 @@ bool CaptureSession::configureEncoder(Size captureSize, Size textureSize) {
     sink_ = std::make_unique<BufferSink>(*buffer_, s.video.codec, segment_, s.video.fps, audioTracks_, framesEncoded_);
     captureSize_ = captureSize;
     forceKeyframe_ = true;
+    // Half a tick early, so timer rounding never pushes a keyframe to the following tick.
+    keyframeInterval100ns_ = clock::secondsTo100ns(std::max(1u, s.video.gopSeconds)) -
+                             clock::kTicksPerSecond / (2 * static_cast<int64_t>(s.video.fps));
+    framesSubmitted_ = framesEncoded_.load(std::memory_order_relaxed); // the old encoder has been flushed
     statsZeroCopy_ = zeroCopy_;
     statsWidth_ = outputSize_.width;
     statsHeight_ = outputSize_.height;
@@ -230,11 +236,13 @@ bool CaptureSession::configureEncoder(Size captureSize, Size textureSize) {
 void CaptureSession::tick(int64_t pts) {
     auto frame = source_->acquireLatest();
     bool ok = true;
+    bool submitted = false;
+    Size textureSize{};
     if (frame) {
         framesCaptured_.fetch_add(1, std::memory_order_relaxed);
         D3D11_TEXTURE2D_DESC td{};
         frame->texture->GetDesc(&td);
-        const Size textureSize{td.Width, td.Height};
+        textureSize = {td.Width, td.Height};
         const Size captureSize{frame->width, frame->height};
         if (!encoder_ || captureSize != captureSize_ || (zeroCopy_ && textureSize != outputSize_)) {
             if (!configureEncoder(captureSize, textureSize)) {
@@ -242,10 +250,16 @@ void CaptureSession::tick(int64_t pts) {
                 return;
             }
         }
-        const uint32_t flags = forceKeyframe_ ? kFrameForceKeyframe : kFrameNone;
+    }
+    // Keyframes follow the clock, so the replay buffer always holds one per gopSeconds however
+    // many unchanged frames were skipped.
+    const bool keyframe = forceKeyframe_ || pts - lastKeyframePts_ >= keyframeInterval100ns_;
+    const uint32_t flags = keyframe ? kFrameForceKeyframe : kFrameNone;
+    if (frame) {
         if (zeroCopy_) {
             ok = encoder_->encodeExternal(frame->texture.get(), frame->owner, pts, flags);
             lastFrame_ = std::move(frame);
+            submitted = true;
         } else if (auto surface = encoder_->acquireSurface()) {
             if (converter_.inputSize() != textureSize &&
                 !converter_.init(gpu_->device.get(), gpu_->context.get(), textureSize, outputSize_,
@@ -253,21 +267,38 @@ void CaptureSession::tick(int64_t pts) {
                 fail("could not configure the colour converter");
                 return;
             }
-            ok = converter_.convert(frame->texture.get(), captureSize, surface->texture, surface->arraySlice) &&
+            ok = converter_.convert(frame->texture.get(), {frame->width, frame->height}, surface->texture,
+                                    surface->arraySlice) &&
                  encoder_->encode(*surface, pts, flags);
             lastSurface_ = surface;
+            submitted = true;
         } else {
             droppedBusy_.fetch_add(1, std::memory_order_relaxed); // every surface still in the encoder
             frame.reset();
         }
-        if (ok) forceKeyframe_ = false;
     } else if (encoder_ && (lastFrame_ || lastSurface_)) {
-        // Nothing changed on screen: repeat the previous frame to keep a constant frame rate.
-        duplicates_.fetch_add(1, std::memory_order_relaxed);
-        ok = zeroCopy_ ? encoder_->encodeExternal(lastFrame_->texture.get(), lastFrame_->owner, pts, kFrameDuplicate)
-                       : encoder_->encode(*lastSurface_, pts, kFrameDuplicate);
+        if (keyframe || config_.settings.video.constantFrameRate) {
+            // Nothing changed on screen: encode the previous picture again, as a keyframe when one is
+            // due, or as a repeat to keep a constant frame rate.
+            const uint32_t repeat = keyframe ? flags : kFrameDuplicate;
+            if (!keyframe) duplicates_.fetch_add(1, std::memory_order_relaxed);
+            ok = zeroCopy_ ? encoder_->encodeExternal(lastFrame_->texture.get(), lastFrame_->owner, pts, repeat)
+                           : encoder_->encode(*lastSurface_, pts, repeat);
+            submitted = true;
+        } else {
+            // Variable frame rate: a repeat costs the encoder as much as a new frame, so skip it; the
+            // previous frame simply shows for longer.
+            unchanged_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
+    if (submitted && ok) {
+        ++framesSubmitted_;
+        if (keyframe) {
+            forceKeyframe_ = false;
+            lastKeyframePts_ = pts;
+        }
+    }
     if (!ok) {
         encodeErrors_.fetch_add(1, std::memory_order_relaxed);
         if (++consecutiveErrors_ >= kMaxConsecutiveErrors) {
@@ -278,6 +309,10 @@ void CaptureSession::tick(int64_t pts) {
         consecutiveErrors_ = 0;
     }
     if (encoder_) encoder_->drain(*sink_);
+    // Once everything submitted has come out, an unchanged tick means the video is complete up to
+    // now; saves then needn't wait for a frame that isn't coming.
+    if (!submitted && encoder_ && framesSubmitted_ == framesEncoded_.load(std::memory_order_relaxed))
+        buffer_->advanceVideoClock(pts);
 }
 
 void CaptureSession::run() {
@@ -344,6 +379,7 @@ SessionStats CaptureSession::stats() const {
     s.framesCaptured = framesCaptured_.load(std::memory_order_relaxed);
     s.framesEncoded = framesEncoded_.load(std::memory_order_relaxed);
     s.duplicates = duplicates_.load(std::memory_order_relaxed);
+    s.unchanged = unchanged_.load(std::memory_order_relaxed);
     s.droppedBusy = droppedBusy_.load(std::memory_order_relaxed);
     s.encodeErrors = encodeErrors_.load(std::memory_order_relaxed);
     s.zeroCopy = statsZeroCopy_.load(std::memory_order_relaxed);

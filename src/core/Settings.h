@@ -27,6 +27,10 @@ struct VideoSettings {
     uint32_t outputHeight = 0; // 0 = native
     uint32_t gopSeconds = 2;
     QualityPreset preset = QualityPreset::Balanced;
+    // Encode every tick, repeating the last frame when nothing changed, for editors that mishandle
+    // variable frame rate. Off: unchanged frames are not encoded at all, which saves the encoder a
+    // full frame's work each time (a repeat costs it about as much as a new frame).
+    bool constantFrameRate = false;
 };
 
 struct AudioSettings {

@@ -9,6 +9,7 @@
 #include "output/FileNaming.h"
 #include "output/WallClock.h"
 
+#include <algorithm>
 #include <deque>
 
 namespace rec {
@@ -101,8 +102,9 @@ void Recorder::run() {
         if (keep != UINT64_MAX) buffer.release(*reader, keep);
     };
 
-    // Writes the first `videoCount` queued frames, and the audio before `audioUntil`.
-    auto writeFragment = [&](size_t videoCount, int64_t audioUntil) {
+    // Writes the first `videoCount` queued frames, the last of them showing until `videoEnd`, and
+    // the audio before `audioUntil`.
+    auto writeFragment = [&](size_t videoCount, int64_t videoEnd, int64_t audioUntil) {
         std::vector<Mp4Sample> v;
         for (size_t i = 0; i < videoCount; ++i) v.push_back({reader->bytes(video[i]), video[i].pts, video[i].keyframe});
         std::vector<std::vector<Mp4Sample>> a(audio.size());
@@ -114,7 +116,7 @@ void Recorder::run() {
             }
             spans.emplace_back(a[t]);
         }
-        const bool ok = file->mp4.writeFragment(file->sink, v, spans);
+        const bool ok = file->mp4.writeFragment(file->sink, v, spans, videoEnd);
         video.erase(video.begin(), video.begin() + static_cast<ptrdiff_t>(videoCount));
         releaseWritten();
         seconds_ = finishedSeconds + file->mp4.durationSeconds();
@@ -188,7 +190,7 @@ void Recorder::run() {
             if (p.segment > segment && p.track == kVideoTrack && p.keyframe) {
                 // Resolution or codec changed: finish this file, continue in a new one.
                 if (file) {
-                    if (!video.empty()) writeFragment(video.size(), p.pts);
+                    if (!video.empty()) writeFragment(video.size(), p.pts, p.pts);
                     finishFile({});
                 }
                 video.clear();
@@ -210,7 +212,7 @@ void Recorder::run() {
             // One fragment per GOP: write everything before the newest complete GOP's keyframe.
             for (size_t k = 1; k < video.size() && !failed; ++k) {
                 if (!video[k].keyframe) continue;
-                if (!writeFragment(k, video[k].pts)) {
+                if (!writeFragment(k, video[k].pts, video[k].pts)) {
                     finishFile("Writing the file failed (is the disk full?)");
                     failed = true;
                 }
@@ -226,7 +228,11 @@ void Recorder::run() {
                 caughtUp = buffer.newestPts(static_cast<uint8_t>(t)) >= stopAt;
             if (caughtUp || clock::now100ns() >= stopDeadline) {
                 if (file) {
-                    if (!video.empty()) writeFragment(video.size(), INT64_MAX);
+                    // Unchanged frames aren't encoded: the last one may have held until the stop.
+                    int64_t end = 0;
+                    if (!video.empty() && stopAt != INT64_MAX && info)
+                        end = std::max(stopAt, video.back().pts + clock::kTicksPerSecond * info->video.fpsDen / info->video.fpsNum);
+                    if (!video.empty()) writeFragment(video.size(), end, INT64_MAX);
                     finishFile({});
                 } else {
                     post({.error = "Nothing was recorded"});

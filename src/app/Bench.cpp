@@ -53,6 +53,7 @@ struct BenchOptions {
     Size synthetic{};       // non-zero = use the synthetic source instead of the screen
     bool rgbInput = false;  // hand BGRA to the encoder (no VideoProcessor pass)
     bool session = false;   // run the real CaptureSession + replay save instead of the raw loop
+    bool constantFrameRate = false; // session mode: encode repeats when nothing changed
     bool forceVideoProcessor = false;
     bool captureOnly = false; // capture and discard (compare capture APIs)
     bool amdCapture = false;
@@ -79,6 +80,7 @@ bool parse(const std::vector<std::wstring>& args, BenchOptions& o) {
         if (a == L"--synthetic") { o.synthetic = {1920, 1080}; continue; }
         if (a == L"--rgb-input") { o.rgbInput = true; continue; }
         if (a == L"--session") { o.session = true; continue; }
+        if (a == L"--cfr") { o.constantFrameRate = true; continue; }
         if (a == L"--video-processor") { o.forceVideoProcessor = true; continue; }
         if (a == L"--capture-only") { o.captureOnly = true; continue; }
         if (a == L"--amd-capture") { o.captureOnly = o.amdCapture = true; continue; }
@@ -346,6 +348,7 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
     cfg.settings.video.bitrateKbps = o.bitrateKbps;
     cfg.settings.video.maxBitrateKbps = o.bitrateKbps * 3 / 2;
     cfg.settings.video.preset = o.preset;
+    cfg.settings.video.constantFrameRate = o.constantFrameRate;
     cfg.settings.capture.captureCursor = o.cursor;
     if (o.rgbInput) cfg.settings.capture.convertPath = ConvertPath::EncoderNative;
     if (o.forceVideoProcessor) cfg.settings.capture.convertPath = ConvertPath::VideoProcessor;
@@ -405,8 +408,8 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
     std::println("--- session {:.1f} s ---", wall);
     std::println("output:               {}x{} via {}", st.outputSize.width, st.outputSize.height,
                  st.zeroCopy ? "zero-copy RGB" : "video processor");
-    std::println("captured/encoded:     {} / {} ({} duplicates, {} dropped busy, {} errors)", st.framesCaptured,
-                 st.framesEncoded, st.duplicates, st.droppedBusy, st.encodeErrors);
+    std::println("captured/encoded:     {} / {} ({} unchanged skipped, {} duplicates, {} dropped busy, {} errors)",
+                 st.framesCaptured, st.framesEncoded, st.unchanged, st.duplicates, st.droppedBusy, st.encodeErrors);
     std::println("replay buffer:        {:.1f} MB held, {:.1f} MB of RAM committed, {:.1f} MB reserved",
                  st.buffer.usedBytes / 1048576.0, st.buffer.committedBytes / 1048576.0,
                  st.buffer.capacityBytes / 1048576.0);

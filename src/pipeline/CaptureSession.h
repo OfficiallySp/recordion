@@ -39,7 +39,8 @@ inline constexpr WPARAM kSessionEnded = 2;  // the captured window or display we
 struct SessionStats {
     uint64_t framesCaptured = 0;
     uint64_t framesEncoded = 0;
-    uint64_t duplicates = 0;
+    uint64_t duplicates = 0;   // repeats encoded for constant frame rate
+    uint64_t unchanged = 0;    // ticks with nothing new on screen that cost the encoder nothing
     uint64_t droppedBusy = 0;
     uint64_t encodeErrors = 0;
     bool zeroCopy = false;
@@ -101,11 +102,15 @@ private:
     bool zeroCopy_ = false;
     uint32_t segment_ = 0;
     bool forceKeyframe_ = true;
-    std::optional<CapturedFrame> lastFrame_;     // zero-copy: re-sent for duplicates
-    std::optional<InputSurface> lastSurface_;    // converted path: re-sent for duplicates
+    int64_t keyframeInterval100ns_ = 0;
+    int64_t lastKeyframePts_ = 0;
+    uint64_t framesSubmitted_ = 0;               // compared with framesEncoded_: is anything still in the encoder?
+    std::optional<CapturedFrame> lastFrame_;     // zero-copy: re-sent for duplicates and keyframes
+    std::optional<InputSurface> lastSurface_;    // converted path: re-sent for duplicates and keyframes
     uint32_t consecutiveErrors_ = 0;
 
-    std::atomic<uint64_t> framesCaptured_{0}, framesEncoded_{0}, duplicates_{0}, droppedBusy_{0}, encodeErrors_{0};
+    std::atomic<uint64_t> framesCaptured_{0}, framesEncoded_{0}, duplicates_{0}, unchanged_{0}, droppedBusy_{0},
+        encodeErrors_{0};
     std::atomic<bool> statsZeroCopy_{false};
     std::atomic<uint32_t> statsWidth_{0}, statsHeight_{0};
 };

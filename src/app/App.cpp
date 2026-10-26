@@ -36,6 +36,8 @@ std::wstring formatClipLength(double seconds) {
 
 constexpr UINT_PTR kRestartTimer = 1;
 constexpr UINT kRestartDelayMs = 2000;
+// A restarted capture that fails again this soon has a lasting problem: stop retrying.
+constexpr ULONGLONG kRestartGraceMs = 30'000;
 
 } // namespace
 
@@ -136,10 +138,11 @@ LRESULT App::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         if (session_) {
             const bool failed = wp == kSessionFailed;
             const bool wanted = !sessionOnlyForRecording_ || game_;
+            const bool failedAgain = failed && restartedAtMs_ && GetTickCount64() - restartedAtMs_ < kRestartGraceMs;
             if (recording()) recorder_->stop(clock::now100ns()); // keeps what was captured
             stopReplay();
             // A GPU driver reset or update, or a display coming and going: try again once, shortly.
-            if (wanted && !restartPending_) {
+            if (wanted && !restartPending_ && !failedAgain) {
                 scheduleRestart();
             } else {
                 toast(failed ? L"Instant replay stopped" : L"Capture ended",
@@ -154,6 +157,7 @@ LRESULT App::handleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             if (game_) game_->monitor = MonitorFromWindow(game_->window, MONITOR_DEFAULTTOPRIMARY); // it may have moved
             startReplay();
             restartPending_ = false;
+            restartedAtMs_ = GetTickCount64();
             if (!replayOn()) toast(L"Instant replay stopped", L"Capture couldn't be restarted. Check the log.", Notifier::Kind::Error);
             else log::info("capture restarted");
         }
@@ -252,6 +256,7 @@ bool App::replayOn() const { return session_ && session_->running(); }
 
 void App::startReplay() {
     if (replayOn()) return;
+    restartedAtMs_ = 0; // set again by the restart timer when this is an automatic restart
     SessionConfig cfg;
     if (game_) {
         // The game's display by default (survives the game recreating its window); the window
@@ -479,8 +484,9 @@ std::vector<std::string> App::statusLines() const {
                                 st.outputSize.height, v.fps, codec, v.tenBit ? " 10-bit" : ""));
     lines.push_back(std::format("Path: {}", st.zeroCopy ? "zero-copy (capture goes straight to the encoder)"
                                                        : "video processor (scaling or colour conversion)"));
-    lines.push_back(std::format("Frames: {} captured, {} encoded, {} repeated, {} dropped", st.framesCaptured,
-                                st.framesEncoded, st.duplicates, st.droppedBusy + st.encodeErrors));
+    lines.push_back(std::format("Frames: {} captured, {} encoded, {} unchanged (skipped), {} repeated, {} dropped",
+                                st.framesCaptured, st.framesEncoded, st.unchanged, st.duplicates,
+                                st.droppedBusy + st.encodeErrors));
     const double held = st.buffer.oldestVideoKeyframePts ? (st.buffer.newestPts[0] - st.buffer.oldestVideoKeyframePts) / 1e7 : 0;
     lines.push_back(std::format("Replay buffer: {:.0f} s held, {:.0f} of {:.0f} MB", held, st.buffer.usedBytes / 1048576.0,
                                 st.buffer.capacityBytes / 1048576.0));

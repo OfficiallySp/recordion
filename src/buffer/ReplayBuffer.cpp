@@ -309,4 +309,9 @@ int64_t ReplayBuffer::newestPts(uint8_t track) const {
     return track < 4 ? newestPts_[track] : 0;
 }
 
+void ReplayBuffer::advanceVideoClock(int64_t pts) {
+    std::scoped_lock lock(mutex_);
+    newestPts_[kVideoTrack] = std::max(newestPts_[kVideoTrack], pts);
+}
+
 } // namespace rec

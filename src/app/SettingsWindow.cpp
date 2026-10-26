@@ -529,6 +529,9 @@ void SettingsWindow::drawVideo() {
         v.tenBit = false;
     } else {
         ImGui::Checkbox("10-bit colour", &v.tenBit);
+        if (v.tenBit)
+            hint("Games draw in 8-bit, so 10-bit mainly smooths banding in gradients. It needs a small colour "
+                 "conversion on your game's GPU (about 0.1 ms a frame); 8-bit goes straight into the encoder.");
     }
     if (v.codec != Codec::H264)
         hint("HEVC and AV1 give better quality per megabyte. Windows' own player needs the free HEVC/AV1 "
@@ -566,6 +569,12 @@ void SettingsWindow::drawVideo() {
                {{0, "Native (no scaling, cheapest)"}, {2160, "2160p"}, {1440, "1440p"}, {1080, "1080p"}, {720, "720p"}});
     comboValue("Keyframe every", v.gopSeconds, {{1, "1 second"}, {2, "2 seconds"}, {4, "4 seconds"}});
     hint("Native resolution lets the capture go straight into the encoder without a scaling pass.");
+    ImGui::Checkbox("Constant frame rate", &v.constantFrameRate);
+    hint(v.constantFrameRate
+             ? "Repeats the last frame whenever nothing changed. A repeat costs the encoder as much as a new "
+               "frame; only needed for editors that mishandle variable frame rate."
+             : "When nothing changes on screen (menus, loading, a game running below the frame rate), the frame "
+               "isn't encoded again. Players and most editors handle this; turn it on for editors that don't.");
 
     heading("Capture");
     auto& c = draft_.capture;

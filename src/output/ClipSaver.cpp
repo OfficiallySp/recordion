@@ -9,6 +9,8 @@
 #include "output/FileNaming.h"
 #include "output/WallClock.h"
 
+#include <algorithm>
+
 namespace rec {
 namespace {
 
@@ -98,7 +100,10 @@ SaveResult ClipSaver::save(const SaveJob& job) {
     }
     const int64_t first = clip.videoSamples.front().time100ns;
     const int64_t last = clip.videoSamples.back().time100ns;
-    r.seconds = clock::toSeconds(last - first) + static_cast<double>(clip.video.fpsDen) / clip.video.fpsNum;
+    // Unchanged frames aren't encoded, so the last one may have been on screen up to the hotkey.
+    const int64_t frame100ns = clock::kTicksPerSecond * clip.video.fpsDen / clip.video.fpsNum;
+    clip.videoEnd100ns = std::max(last + frame100ns, job.to100ns);
+    r.seconds = clock::toSeconds(clip.videoEnd100ns - first);
 
     const FILETIME startWall = wallclock::fromQpc(first, job.anchorQpc100ns, job.anchorWall);
     clip.title = job.game;

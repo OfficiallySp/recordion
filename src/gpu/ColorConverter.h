@@ -36,9 +36,11 @@ public:
 
 private:
     ID3D11VideoProcessorInputView* inputView(ID3D11Texture2D* texture);
+    ID3D11VideoProcessorInputView* copiedInputView(ID3D11Texture2D* texture);
     ID3D11VideoProcessorOutputView* outputView(ID3D11Texture2D* texture, UINT slice);
 
     winrt::com_ptr<ID3D11VideoDevice> videoDevice_;
+    winrt::com_ptr<ID3D11DeviceContext> context_;
     winrt::com_ptr<ID3D11VideoContext1> videoContext_;
     winrt::com_ptr<ID3D11VideoProcessorEnumerator> enumerator_;
     winrt::com_ptr<ID3D11VideoProcessor> processor_;
@@ -49,6 +51,9 @@ private:
 
     // Small caches: WGC cycles through a handful of pool surfaces; encoders own ~8 input surfaces.
     std::vector<std::pair<ID3D11Texture2D*, winrt::com_ptr<ID3D11VideoProcessorInputView>>> inputViews_;
+    // For sources whose textures the video processor refuses (AMD Direct Capture's): copied here first.
+    winrt::com_ptr<ID3D11Texture2D> copy_;
+    winrt::com_ptr<ID3D11VideoProcessorInputView> copyView_;
     struct OutputKey {
         ID3D11Texture2D* texture;
         UINT slice;

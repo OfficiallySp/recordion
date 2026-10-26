@@ -84,6 +84,7 @@ private:
     // The session was started only for a recording (instant replay is off): stop it afterwards.
     bool sessionOnlyForRecording_ = false;
     bool restartPending_ = false;  // capture failed; one automatic restart is scheduled
+    ULONGLONG restartedAtMs_ = 0;  // when the last automatic restart started capture (0 = not restarted)
     bool resumeReplay_ = false;    // instant replay was on when the PC went to sleep
     void scheduleRestart();
 };

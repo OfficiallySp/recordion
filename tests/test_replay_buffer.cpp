@@ -61,6 +61,20 @@ TEST_CASE("old packets are evicted by duration") {
     CHECK(s.usedBytes <= 121 * 100 + 100);
 }
 
+TEST_CASE("the video clock moves on while nothing changes on screen") {
+    ReplayBuffer b;
+    REQUIRE(b.init(options(1 << 20, 100)));
+    appendVideo(b, 60, 60, 100); // 1 s
+    b.advanceVideoClock(3 * 10'000'000);
+    CHECK(b.newestPts(rec::kVideoTrack) == 3 * 10'000'000);
+    b.advanceVideoClock(2 * 10'000'000); // never backwards
+    CHECK(b.newestPts(rec::kVideoTrack) == 3 * 10'000'000);
+    // A save up to the clock gets every frame, ending with the last one encoded.
+    auto snap = b.snapshot(0, 3 * 10'000'000);
+    REQUIRE(snap);
+    CHECK(snap->packets.back().pts == 59 * kFrame);
+}
+
 TEST_CASE("old packets are evicted when the arena is full, and data never wraps mid-packet") {
     ReplayBuffer b;
     REQUIRE(b.init(options(1 << 16, 1000))); // 64 KB arena

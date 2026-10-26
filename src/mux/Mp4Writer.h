@@ -45,6 +45,9 @@ struct Mp4AudioInput {
 struct Mp4ClipInput {
     Mp4VideoTrack video;
     std::vector<Mp4Sample> videoSamples; // must start with a keyframe
+    // When the last frame stops showing (variable frame rate: it holds until the next change or the
+    // end of the clip). 0 or not after the last sample: one nominal frame duration.
+    int64_t videoEnd100ns = 0;
     std::vector<Mp4AudioInput> audio;
     std::string title;          // shown by players / Explorer
     int64_t creationUnixTime = 0;
@@ -65,8 +68,11 @@ public:
     bool begin(ByteSink& sink, const Mp4VideoTrack& video, const std::vector<Mp4AudioTrack>& audio,
                int64_t videoStart100ns, const std::vector<int64_t>& audioStart100ns, std::string title,
                int64_t creationUnixTime);
-    // One fragment; the video should start on a keyframe. Empty spans are fine.
-    bool writeFragment(ByteSink& sink, std::span<const Mp4Sample> video, const std::vector<std::span<const Mp4Sample>>& audio);
+    // One fragment; the video should start on a keyframe. Empty spans are fine. `videoEnd100ns` is
+    // when the fragment's last frame stops showing (usually the next fragment's first frame); 0 =
+    // one nominal frame duration.
+    bool writeFragment(ByteSink& sink, std::span<const Mp4Sample> video, const std::vector<std::span<const Mp4Sample>>& audio,
+                       int64_t videoEnd100ns = 0);
     // After the sink's file is closed: appends the complete moov and retires the fragment boxes.
     bool finish(const std::filesystem::path& file);
 

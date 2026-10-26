@@ -239,6 +239,60 @@ TEST_CASE("hybrid MP4: playable while fragmented, an ordinary MP4 after finish()
     std::filesystem::remove(path);
 }
 
+TEST_CASE("variable frame rate: each frame holds until the next, the last until the end time") {
+    const auto aus = splitAccessUnits(Codec::H264, readFile("h264_202x114.h264"));
+    REQUIRE(aus.size() == 4);
+    const auto config = bs::parseVideoConfig(Codec::H264, aus[0].bytes);
+    REQUIRE(config);
+
+    // Unchanged frames weren't encoded: 0, 1/60 s, then nothing new until 0.5 s and 0.6 s; the
+    // last frame stays on screen until the hotkey at 1.5 s.
+    const int64_t base = 555'555'555;
+    const int64_t times[] = {0, 166'667, 5'000'000, 6'000'000};
+    const int64_t end = base + 15'000'000;
+    std::vector<std::vector<uint8_t>> data(aus.size());
+    std::vector<rec::Mp4Sample> video;
+    for (size_t i = 0; i < aus.size(); ++i) {
+        bs::appendSample(Codec::H264, aus[i].bytes, data[i]);
+        video.push_back({data[i], base + times[i], aus[i].keyframe});
+    }
+    const rec::Mp4VideoTrack track{Codec::H264, 202, 114, 60, 1, config->configRecord};
+
+    rec::Mp4ClipInput clip;
+    clip.video = track;
+    clip.videoSamples = video;
+    clip.videoEnd100ns = end;
+    rec::VectorSink clipSink;
+    REQUIRE(rec::writeMp4Clip(clip, clipSink));
+
+    rec::VectorSink fragSink;
+    rec::Mp4FragmentedWriter w;
+    REQUIRE(w.begin(fragSink, track, {}, base, {}, "Test Game", 1'791'763'200));
+    REQUIRE(w.writeFragment(fragSink, std::span(video).subspan(0, 2), {}, video[2].time100ns));
+    REQUIRE(w.writeFragment(fragSink, std::span(video).subspan(2), {}, end));
+    CHECK(w.durationSeconds() == doctest::Approx(1.5));
+
+    const auto clipPath = std::filesystem::temp_directory_path() / "recordion_vfr_clip.mp4";
+    const auto hybridPath = std::filesystem::temp_directory_path() / "recordion_vfr_hybrid.mp4";
+    for (const auto& [path, bytes] : {std::pair{clipPath, &clipSink.data}, std::pair{hybridPath, &fragSink.data}})
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(bytes->data()),
+                                                     static_cast<std::streamsize>(bytes->size()));
+#if defined(RECORDION_FFPROBE)
+    auto durations = [](const std::filesystem::path& path) {
+        return run(std::string("\"\"") + RECORDION_FFPROBE +
+                   "\" -v error -select_streams v:0 -show_entries packet=duration_time -of csv=p=0 \"" + path.string() +
+                   "\"\"");
+    };
+    const std::string expected = "0.016667\n0.483333\n0.100000\n0.900000\n";
+    CHECK(durations(clipPath) == expected);
+    CHECK(durations(hybridPath) == expected); // as if the recorder had been killed
+    REQUIRE(w.finish(hybridPath));
+    CHECK(durations(hybridPath) == expected);
+#endif
+    std::filesystem::remove(clipPath);
+    std::filesystem::remove(hybridPath);
+}
+
 TEST_CASE("clip writer rejects input that doesn't start with a keyframe") {
     const std::vector<uint8_t> data{0, 0, 0, 1, 0x41};
     rec::Mp4ClipInput in;

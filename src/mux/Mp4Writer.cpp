@@ -57,6 +57,8 @@ void layoutVideo(Track& t, const Mp4ClipInput& in) {
         prev = std::max(dts, prev + 1);
     }
     t.deltas.back() = nominal;
+    if (in.videoEnd100ns > s.back().time100ns)
+        t.deltas.back() = static_cast<uint32_t>(std::max<int64_t>(1, rescale(in.videoEnd100ns - t0, 10'000'000, t.timescale) - prev));
     for (uint32_t d : t.deltas) t.mediaDuration += d;
     t.editDurationMovie = static_cast<uint64_t>(rescale(static_cast<int64_t>(t.mediaDuration), t.timescale, kMovieTimescale));
 }
@@ -520,7 +522,7 @@ bool Mp4FragmentedWriter::begin(ByteSink& sink, const Mp4VideoTrack& video, cons
 }
 
 bool Mp4FragmentedWriter::writeFragment(ByteSink& sink, std::span<const Mp4Sample> video,
-                                        const std::vector<std::span<const Mp4Sample>>& audio) {
+                                        const std::vector<std::span<const Mp4Sample>>& audio, int64_t videoEnd100ns) {
     if (video.empty() && std::ranges::all_of(audio, [](const auto& a) { return a.empty(); })) return true;
     const uint32_t vts = videoTimescale(tables_.video);
     const auto nominal = static_cast<uint32_t>(std::max<int64_t>(1, int64_t{vts} * tables_.video.fpsDen / tables_.video.fpsNum));
@@ -543,9 +545,14 @@ bool Mp4FragmentedWriter::writeFragment(ByteSink& sink, std::span<const Mp4Sampl
             r.durations.push_back(static_cast<uint32_t>(std::max<int64_t>(1, dts - prev)));
             prev = std::max(dts, prev + 1);
         }
-        r.durations.push_back(nominal);
+        const bool endKnown = videoEnd100ns > video.back().time100ns;
+        r.durations.push_back(endKnown ? static_cast<uint32_t>(std::max<int64_t>(
+                                             1, rescale(videoEnd100ns - videoStart_, 10'000'000, vts) - prev))
+                                       : nominal);
         r.samples = video;
         runs.push_back(std::move(r));
+        // The final moov derives every other duration from the next sample; the last needs this.
+        tables_.videoEnd100ns = endKnown ? videoEnd100ns : 0;
     }
     for (size_t i = 0; i < audio.size() && i < tables_.audio.size(); ++i) {
         if (audio[i].empty()) continue;
@@ -616,6 +623,7 @@ bool Mp4FragmentedWriter::writeFragment(ByteSink& sink, std::span<const Mp4Sampl
 double Mp4FragmentedWriter::durationSeconds() const {
     const auto& v = tables_.videoSamples;
     if (v.empty()) return 0;
+    if (tables_.videoEnd100ns > v.back().time100ns) return (tables_.videoEnd100ns - v.front().time100ns) / 1e7;
     return (v.back().time100ns - v.front().time100ns) / 1e7 + static_cast<double>(tables_.video.fpsDen) / tables_.video.fpsNum;
 }
 

@@ -34,7 +34,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(ConvertPath, {{ConvertPath::Auto, "auto"},
 NLOHMANN_JSON_SERIALIZE_ENUM(BufferStorage, {{BufferStorage::RAM, "ram"}, {BufferStorage::Disk, "disk"}})
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(VideoSettings, vendor, codec, tenBit, rateControl, bitrateKbps,
-                                                maxBitrateKbps, cqLevel, fps, outputHeight, gopSeconds, preset)
+                                                maxBitrateKbps, cqLevel, fps, outputHeight, gopSeconds, preset,
+                                                constantFrameRate)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(AudioSettings, captureSystem, gameAudioOnly, captureMic, micDeviceId,
                                                 separateTracks, bitrateKbps)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ReplaySettings, enabledInGames, desktopAlwaysOn, seconds, storage)
