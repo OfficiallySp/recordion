@@ -74,6 +74,7 @@ private:
     winrt::com_ptr<ID3D11RenderTargetView> rtv_;
     float dpiScale_ = 1.0f;
     bool dpiChanged_ = false;
+    bool inFrame_ = false; // drawing; see render()
     ImFont* font_ = nullptr;
 
     Settings draft_;

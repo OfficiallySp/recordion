@@ -424,12 +424,16 @@ bool SettingsWindow::captureHotkey(UINT msg, WPARAM wp) {
 }
 
 void SettingsWindow::render() {
-    if (!ImGui::GetCurrentContext() || !rtv_) return;
+    // The file pickers run a modal message loop mid-frame that keeps delivering WM_TIMER. A nested frame
+    // would end the one in progress, leaving ImGui without a current window when the picker returns.
+    if (!ImGui::GetCurrentContext() || !rtv_ || inFrame_) return;
     if (dpiChanged_) applyDpi();
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
+    inFrame_ = true;
     drawUi();
+    inFrame_ = false;
     ImGui::Render();
     const float clear[4] = {0.086f, 0.086f, 0.098f, 1};
     ID3D11RenderTargetView* rtv = rtv_.get();
