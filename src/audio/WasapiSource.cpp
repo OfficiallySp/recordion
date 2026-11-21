@@ -119,6 +119,8 @@ bool WasapiSource::initClient(bool loopback) {
         log::warn("audio: Initialize failed (0x{:08X})", static_cast<uint32_t>(hr));
         return false;
     }
+    // Event mode is what process loopback is documented with; the audio thread polls rather than
+    // waiting on the event, so it is only ever set, never waited on.
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (FAILED(client_->SetEventHandle(event_)) || FAILED(client_->GetService(IID_PPV_ARGS(capture_.put()))) ||
         FAILED(client_->Start()))

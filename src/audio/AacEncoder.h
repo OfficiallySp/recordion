@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mfobjects.h>
 #include <mftransform.h>
 
 #include <winrt/base.h>
@@ -38,6 +39,9 @@ private:
     bool pull(const FrameCallback& onFrame);
 
     winrt::com_ptr<IMFTransform> mft_;
+    winrt::com_ptr<IMFSample> inSample_, outSample_;
+    winrt::com_ptr<IMFMediaBuffer> inBuffer_, outBuffer_;
+    DWORD inCapacity_ = 0;
     std::vector<uint8_t> asc_;
     uint32_t kbps_ = 0;
     uint32_t outputBufferSize_ = 0;

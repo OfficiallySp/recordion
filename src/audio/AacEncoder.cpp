@@ -14,9 +14,20 @@ namespace {
 
 LONGLONG samplesTo100ns(uint64_t samples) { return static_cast<LONGLONG>(samples * 10'000'000 / AacEncoder::kSampleRate); }
 
+// True if nothing but our own reference holds `p` (null counts as "no").
+bool soleOwner(::IUnknown* p) {
+    if (!p) return false;
+    p->AddRef();
+    return p->Release() == 1;
+}
+
 } // namespace
 
 AacEncoder::~AacEncoder() {
+    inSample_ = nullptr;
+    inBuffer_ = nullptr;
+    outSample_ = nullptr;
+    outBuffer_ = nullptr;
     mft_ = nullptr;
     if (mfStarted_) MFShutdown();
 }
@@ -84,24 +95,30 @@ bool AacEncoder::init(uint32_t kbps) {
 bool AacEncoder::encode(std::span<const int16_t> pcm, const FrameCallback& onFrame) {
     if (!mft_ || pcm.empty()) return mft_ != nullptr;
     const DWORD bytes = static_cast<DWORD>(pcm.size_bytes());
-    winrt::com_ptr<IMFMediaBuffer> buffer;
-    winrt::com_ptr<IMFSample> sample;
-    if (FAILED(MFCreateMemoryBuffer(bytes, buffer.put())) || FAILED(MFCreateSample(sample.put()))) return false;
+    // Reuse the input sample once the encoder has let go of it (it normally copies the PCM).
+    if (!soleOwner(inSample_.get()) || !soleOwner(inBuffer_.get()) || inCapacity_ < bytes) {
+        inSample_ = nullptr;
+        inBuffer_ = nullptr;
+        if (FAILED(MFCreateMemoryBuffer(bytes, inBuffer_.put())) || FAILED(MFCreateSample(inSample_.put())) ||
+            FAILED(inSample_->AddBuffer(inBuffer_.get())))
+            return false;
+        inCapacity_ = bytes;
+    }
     BYTE* dst = nullptr;
-    buffer->Lock(&dst, nullptr, nullptr);
+    if (FAILED(inBuffer_->Lock(&dst, nullptr, nullptr))) return false;
     std::memcpy(dst, pcm.data(), bytes);
-    buffer->Unlock();
-    buffer->SetCurrentLength(bytes);
-    sample->AddBuffer(buffer.get());
+    inBuffer_->Unlock();
+    inBuffer_->SetCurrentLength(bytes);
+    IMFSample* sample = inSample_.get();
     const uint64_t frames = pcm.size() / kChannels;
     sample->SetSampleTime(samplesTo100ns(inputSamples_));
     sample->SetSampleDuration(samplesTo100ns(inputSamples_ + frames) - samplesTo100ns(inputSamples_));
     inputSamples_ += frames;
 
-    HRESULT hr = mft_->ProcessInput(0, sample.get(), 0);
+    HRESULT hr = mft_->ProcessInput(0, sample, 0);
     if (hr == MF_E_NOTACCEPTING) {
         if (!pull(onFrame)) return false;
-        hr = mft_->ProcessInput(0, sample.get(), 0);
+        hr = mft_->ProcessInput(0, sample, 0);
     }
     if (FAILED(hr)) {
         log::error("aac: ProcessInput failed (0x{:08X})", static_cast<uint32_t>(hr));
@@ -111,13 +128,18 @@ bool AacEncoder::encode(std::span<const int16_t> pcm, const FrameCallback& onFra
 }
 
 bool AacEncoder::pull(const FrameCallback& onFrame) {
+    // One output sample, reused: the encoder only writes into it (it doesn't provide samples).
+    if (!outSample_) {
+        if (FAILED(MFCreateMemoryBuffer(outputBufferSize_, outBuffer_.put())) || FAILED(MFCreateSample(outSample_.put())) ||
+            FAILED(outSample_->AddBuffer(outBuffer_.get()))) {
+            outSample_ = nullptr;
+            outBuffer_ = nullptr;
+            return false;
+        }
+    }
     for (;;) {
-        winrt::com_ptr<IMFMediaBuffer> buffer;
-        winrt::com_ptr<IMFSample> sample;
-        MFCreateMemoryBuffer(outputBufferSize_, buffer.put());
-        MFCreateSample(sample.put());
-        sample->AddBuffer(buffer.get());
-        MFT_OUTPUT_DATA_BUFFER out{0, sample.get(), 0, nullptr};
+        outBuffer_->SetCurrentLength(0);
+        MFT_OUTPUT_DATA_BUFFER out{0, outSample_.get(), 0, nullptr};
         DWORD status = 0;
         const HRESULT hr = mft_->ProcessOutput(0, 1, &out, &status);
         if (out.pEvents) out.pEvents->Release();
@@ -128,9 +150,9 @@ bool AacEncoder::pull(const FrameCallback& onFrame) {
         }
         BYTE* data = nullptr;
         DWORD length = 0;
-        buffer->Lock(&data, nullptr, &length);
+        outBuffer_->Lock(&data, nullptr, &length);
         if (length) onFrame({data, length}, framesOut_++);
-        buffer->Unlock();
+        outBuffer_->Unlock();
     }
 }
 

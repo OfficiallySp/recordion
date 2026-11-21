@@ -27,9 +27,6 @@ public:
     bool start(Kind kind, DWORD pid = 0, const std::wstring& deviceId = {});
     void stop();
 
-    // Signalled when the device has data; the audio thread also polls on a timer, since loopback
-    // streams go quiet while nothing plays.
-    HANDLE event() const { return event_; }
     // Moves all available packets into `ring`. Returns false if the device was lost.
     bool read(const AudioTimeline& timeline, AudioRing& ring);
     Kind kind() const { return kind_; }

@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include <immintrin.h>
+
 namespace rec {
 namespace {
 
@@ -18,7 +20,10 @@ constexpr int64_t kFrame = AacEncoder::kFrameSamples;
 // Mix this far behind real time so every source has delivered (device buffers are ~10-20 ms;
 // loopback can lag a little more under load).
 constexpr int64_t kMixLatencyFrames = AudioTimeline::kRate / 10; // 100 ms
-constexpr DWORD kPollMs = 10;
+// Sources are read on a timer rather than on each device event (every ~10 ms per device): mixing
+// runs 100 ms behind and device buffers hold 200 ms, so this halves the thread's wake-ups or better
+// at no cost in latency.
+constexpr DWORD kPollMs = 20;
 constexpr int64_t kRetry100ns = 10'000'000; // reopen a lost device after 1 s
 
 // Tells the audio thread when the user picks a different default output or input device, so
@@ -40,9 +45,17 @@ struct DefaultDeviceWatcher : winrt::implements<DefaultDeviceWatcher, IMMNotific
     HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
 };
 
-int16_t toPcm16(float v) {
-    v = std::clamp(v, -1.0f, 1.0f);
-    return static_cast<int16_t>(std::lrintf(v * 32767.0f));
+// Clamp to [-1, 1], scale and round to nearest, eight samples at a time (std::lrintf is a CRT call
+// per sample).
+void toPcm16(const float* in, int16_t* out, size_t n) {
+    const __m128 lo = _mm_set1_ps(-1.0f), hi = _mm_set1_ps(1.0f), scale = _mm_set1_ps(32767.0f);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128 a = _mm_mul_ps(_mm_min_ps(_mm_max_ps(_mm_loadu_ps(in + i), lo), hi), scale);
+        const __m128 b = _mm_mul_ps(_mm_min_ps(_mm_max_ps(_mm_loadu_ps(in + i + 4), lo), hi), scale);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i), _mm_packs_epi32(_mm_cvtps_epi32(a), _mm_cvtps_epi32(b)));
+    }
+    for (; i < n; ++i) out[i] = static_cast<int16_t>(std::lrintf(std::clamp(in[i], -1.0f, 1.0f) * 32767.0f));
 }
 
 } // namespace
@@ -138,12 +151,9 @@ void AudioPipeline::run() {
     if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(enumerator.put()))))
         enumerator->RegisterEndpointNotificationCallback(watcher.get());
 
-    std::vector<HANDLE> waits;
+    std::vector<HANDLE> waits{stopEvent_.get()};
+    if (watcher->wake) waits.push_back(watcher->wake); // a null handle would fail every wait
     for (;;) {
-        waits.assign({stopEvent_.get()});
-        if (watcher->wake) waits.push_back(watcher->wake); // a null handle would fail every wait
-        for (auto& s : sources_)
-            if (s->active) waits.push_back(s->wasapi.event());
         const DWORD r = WaitForMultipleObjects(static_cast<DWORD>(waits.size()), waits.data(), FALSE, kPollMs);
         if (r == WAIT_OBJECT_0) break;
 
@@ -194,7 +204,7 @@ void AudioPipeline::mixAndEncode(int64_t upTo) {
             std::fill(mix_.begin(), mix_.end(), 0.0f);
             for (auto& s : sources_)
                 if ((s->game && t.game) || (!s->game && t.mic)) s->ring.mixInto(nextFrame_, kFrame, 1.0f, mix_.data());
-            for (size_t i = 0; i < mix_.size(); ++i) pcm_[i] = toPcm16(mix_[i]);
+            toPcm16(mix_.data(), pcm_.data(), mix_.size());
 
             t.encoder.encode(pcm_, [&](std::span<const uint8_t> frame, uint64_t k) { emit(ti, k, frame); });
         }

@@ -1,4 +1,5 @@
 #include "audio/AacEncoder.h"
+#include "audio/AudioRing.h"
 #include "mux/Bitstream.h"
 #include "mux/Mp4Writer.h"
 
@@ -12,6 +13,8 @@
 #include <fstream>
 #include <iterator>
 #include <numbers>
+#include <random>
+#include <vector>
 
 namespace {
 
@@ -122,4 +125,77 @@ TEST_CASE("AAC encoder produces 1024-sample frames and an AudioSpecificConfig") 
     const long corrected = decodedOnset(frames, enc.audioSpecificConfig(), rec::AacEncoder::kPrimingSamples);
     CHECK(std::abs(corrected - static_cast<long>(kOnset)) <= 16);
 #endif
+}
+
+namespace {
+
+// The ring's original per-sample implementation, as the reference for the run-based one.
+class ReferenceRing {
+public:
+    explicit ReferenceRing(size_t capacity) : data_(capacity * 2, 0.0f), capacity_(capacity) {}
+    void write(int64_t pos, const float* samples, size_t frames) {
+        if (frames == 0) return;
+        if (pos > end_) {
+            for (int64_t p = std::max({end_, pos - static_cast<int64_t>(capacity_), int64_t{0}}); p < pos; ++p)
+                slot(p)[0] = slot(p)[1] = 0.0f;
+        }
+        for (size_t i = 0; i < frames; ++i) {
+            float* dst = slot(pos + static_cast<int64_t>(i));
+            dst[0] = samples ? samples[2 * i] : 0.0f;
+            dst[1] = samples ? samples[2 * i + 1] : 0.0f;
+        }
+        end_ = std::max(end_, pos + static_cast<int64_t>(frames));
+        if (start_ < 0 || pos < start_) start_ = pos;
+        start_ = std::max(start_, end_ - static_cast<int64_t>(capacity_));
+    }
+    int64_t end() const { return end_; }
+    void mixInto(int64_t pos, size_t frames, float gain, float* out) const {
+        for (size_t i = 0; i < frames; ++i) {
+            const int64_t p = pos + static_cast<int64_t>(i);
+            if (start_ < 0 || p < start_ || p >= end_) continue;
+            out[2 * i] += gain * slot(p)[0];
+            out[2 * i + 1] += gain * slot(p)[1];
+        }
+    }
+
+private:
+    float* slot(int64_t p) { return &data_[static_cast<size_t>(p % static_cast<int64_t>(capacity_)) * 2]; }
+    const float* slot(int64_t p) const { return &data_[static_cast<size_t>(p % static_cast<int64_t>(capacity_)) * 2]; }
+    std::vector<float> data_;
+    size_t capacity_;
+    int64_t start_ = -1;
+    int64_t end_ = 0;
+};
+
+} // namespace
+
+TEST_CASE("AudioRing matches the per-sample reference across wraps, gaps and overwrites") {
+    constexpr size_t kCapacity = 1000;
+    rec::AudioRing ring(kCapacity);
+    ReferenceRing ref(kCapacity);
+    std::mt19937 rng(1234);
+    std::vector<float> input(2 * 2500), a, b;
+    for (auto& v : input) v = std::uniform_real_distribution<float>(-1, 1)(rng);
+
+    int64_t pos = 0;
+    for (int step = 0; step < 3000; ++step) {
+        const int kind = static_cast<int>(rng() % 10);
+        size_t frames = rng() % 400;
+        if (kind == 0) frames = kCapacity + rng() % 1500; // larger than the ring
+        if (kind == 1) pos += rng() % 2500;                // a gap: silence
+        if (kind == 2 && pos > 300) pos -= rng() % 300;    // overlap (a resync backwards)
+        const float* samples = kind == 3 ? nullptr : input.data() + 2 * (rng() % 50);
+        ring.write(pos, samples, frames);
+        ref.write(pos, samples, frames);
+        pos += static_cast<int64_t>(frames);
+
+        const int64_t from = std::max<int64_t>(0, pos - static_cast<int64_t>(rng() % 1600));
+        const size_t n = rng() % 1200;
+        a.assign(n * 2, 0.25f);
+        b.assign(n * 2, 0.25f);
+        ring.mixInto(from, n, 0.5f, a.data());
+        ref.mixInto(from, n, 0.5f, b.data());
+        REQUIRE(a == b);
+        REQUIRE(ring.end() == ref.end());
+    }
 }
