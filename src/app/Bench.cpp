@@ -25,15 +25,21 @@
 #include <windows.h>
 #include <intrin.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <format>
 #include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
 #include <print>
+#include <thread>
 
 namespace rec {
 namespace {
@@ -61,6 +67,9 @@ struct BenchOptions {
     std::wstring outDir;
     DWORD pid = 0; // session mode: capture only this process's audio
     double recordSeconds = 0; // session mode: also make a manual recording this long
+    bool noAudio = false;     // session mode: video only
+    bool micOnly = false;     // session mode: the default microphone, no system audio
+    std::wstring profileThread; // session mode: sample this thread's instruction pointer
     // Encoder tuning (encode mode).
     RateControl rateControl = RateControl::VBR;
     uint32_t peakKbps = 0; // 0 = 1.5x the bitrate
@@ -81,7 +90,9 @@ void usage() {
                  "                          [--rc vbr|cbr|cqp] [--peak KBPS] [--cq N] [--gop SECONDS] [--out file.mp4]]\n"
                  "                         [--dump-frame file.yuv]\n"
                  "                         [--source-raw file.bgra --source-size WxH]  (encode grabbed frames)\n"
-                 "       recordion --bench --grab-raw file.bgra --frames N [--fps N] [--monitor N]");
+                 "       recordion --bench --grab-raw file.bgra --frames N [--fps N] [--monitor N]\n"
+                 "       recordion --bench --session [--synthetic] [--mic | --no-audio] [--profile-thread NAME]\n"
+                 "                         [--replay N] [--record N] [--out-dir DIR]  (the real pipeline; CPU by thread)");
 }
 
 // Replays frames saved by --grab-raw (tightly packed BGRA, no header) once, at the bench's pace, so
@@ -221,6 +232,8 @@ bool parse(const std::vector<std::wstring>& args, BenchOptions& o) {
         if (a == L"--skip-unchanged") { o.skipUnchanged = true; continue; }
         if (a == L"--video-processor") { o.forceVideoProcessor = true; continue; }
         if (a == L"--capture-only") { o.captureOnly = true; continue; }
+        if (a == L"--no-audio") { o.noAudio = true; continue; }
+        if (a == L"--mic") { o.micOnly = true; continue; }
         if (a == L"--amd-capture") { o.captureOnly = o.amdCapture = true; continue; }
         const std::wstring* v = next();
         if (!v) return false;
@@ -233,6 +246,7 @@ bool parse(const std::vector<std::wstring>& args, BenchOptions& o) {
         else if (a == L"--dump-frame") o.dumpFrame = *v;
         else if (a == L"--replay") o.replaySeconds = static_cast<uint32_t>(std::stoul(*v));
         else if (a == L"--out-dir") o.outDir = *v;
+        else if (a == L"--profile-thread") o.profileThread = *v;
         else if (a == L"--pid") o.pid = static_cast<DWORD>(std::stoul(*v));
         else if (a == L"--record") o.recordSeconds = std::stod(*v);
         else if (a == L"--peak") o.peakKbps = static_cast<uint32_t>(std::stoul(*v));
@@ -348,6 +362,167 @@ uint64_t processCycles() {
     QueryProcessCycleTime(GetCurrentProcess(), &c);
     return c;
 }
+
+// CPU cycles of every thread in this process, by thread id, with its description.
+struct ThreadCpu {
+    std::wstring name;
+    uint64_t cycles = 0;
+};
+std::map<DWORD, ThreadCpu> threadCpuSnapshot() {
+    std::map<DWORD, ThreadCpu> out;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return out;
+    THREADENTRY32 te{sizeof(te)};
+    const DWORD self = GetCurrentProcessId();
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != self) continue;
+        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        ThreadCpu& tc = out[te.th32ThreadID];
+        ULONG64 c = 0;
+        QueryThreadCycleTime(t, &c);
+        tc.cycles = c;
+        PWSTR desc = nullptr;
+        if (SUCCEEDED(GetThreadDescription(t, &desc)) && desc) {
+            tc.name = desc;
+            LocalFree(desc);
+        }
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    return out;
+}
+
+// Prints each thread's share of one core between two snapshots, busiest first, grouped by name.
+void printThreadCpu(const std::map<DWORD, ThreadCpu>& before, const std::map<DWORD, ThreadCpu>& after, double hz,
+                    double wall) {
+    std::map<std::wstring, double> byName;
+    for (const auto& [tid, tc] : after) {
+        const auto it = before.find(tid);
+        const uint64_t c = tc.cycles - (it != before.end() ? it->second.cycles : 0);
+        byName[tc.name.empty() ? L"(unnamed: runtime/driver)" : tc.name] += 100.0 * c / hz / wall;
+    }
+    std::vector<std::pair<double, std::wstring>> rows;
+    for (const auto& [name, pct] : byName) rows.emplace_back(pct, name);
+    std::ranges::sort(rows, std::greater{});
+    for (const auto& [pct, name] : rows)
+        if (pct >= 0.005) std::println("  {:<26} {:.2f}% of one core", narrow(name), pct);
+}
+
+// Statistical profiler for one named thread of this process: suspends it at random 0.2-0.8 ms
+// intervals, records its instruction pointer, and maps the addresses to module!export afterwards
+// (samples sitting in a wait syscall count as blocked). Spins one core while it runs; development
+// only (`--profile-thread NAME`).
+class ThreadSampler {
+public:
+    explicit ThreadSampler(std::wstring name) : name_(std::move(name)) {}
+    ~ThreadSampler() { stop(); }
+    void start() {
+        stop_ = false;
+        thread_ = std::thread([this] { run(); });
+    }
+    void stop() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.join();
+    }
+    void print() const {
+        std::map<std::string, uint64_t> byModule, bySymbol;
+        size_t blocked = 0;
+        for (size_t i = 0; i < count_; ++i) {
+            auto [module, symbol] = describe(rips_[i]);
+            if (module == "ntdll.dll" && (symbol.starts_with("NtWaitFor") || symbol.starts_with("NtDelayExecution") ||
+                                          symbol.starts_with("NtRemoveIoCompletion") || symbol.starts_with("NtWaitForAlert"))) {
+                ++blocked; // asleep in a wait, not using the CPU
+                continue;
+            }
+            ++byModule[module];
+            ++bySymbol[module + "!" + symbol];
+        }
+        const size_t running = count_ - blocked;
+        std::println("profile of \"{}\": {} samples, {} blocked in a wait, {} running", narrow(name_), count_, blocked,
+                     running);
+        auto top = [&](const std::map<std::string, uint64_t>& m, size_t n) {
+            std::vector<std::pair<uint64_t, std::string>> v;
+            for (const auto& [k, c] : m) v.emplace_back(c, k);
+            std::ranges::sort(v, std::greater{});
+            for (size_t i = 0; i < std::min(n, v.size()); ++i)
+                std::println("  {:5.1f}%  {}", 100.0 * v[i].first / std::max<size_t>(1, running), v[i].second);
+        };
+        std::println(" by module:");
+        top(byModule, 12);
+        std::println(" by function (nearest export):");
+        top(bySymbol, 30);
+    }
+
+private:
+    static std::pair<std::string, std::string> describe(uint64_t rip) {
+        HMODULE m = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCWSTR>(rip), &m))
+            return {"?", std::format("{:x}", rip)};
+        wchar_t path[MAX_PATH];
+        GetModuleFileNameW(m, path, MAX_PATH);
+        std::string module = narrow(std::filesystem::path(path).filename().wstring());
+        const auto base = reinterpret_cast<const uint8_t*>(m);
+        const uint64_t rva = rip - reinterpret_cast<uint64_t>(m);
+        auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        std::string best = std::format("+{:x}", rva);
+        if (dir.VirtualAddress && dir.Size) {
+            auto* exp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+            auto* names = reinterpret_cast<const DWORD*>(base + exp->AddressOfNames);
+            auto* ordinals = reinterpret_cast<const WORD*>(base + exp->AddressOfNameOrdinals);
+            auto* functions = reinterpret_cast<const DWORD*>(base + exp->AddressOfFunctions);
+            uint64_t bestRva = 0;
+            for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+                const DWORD f = functions[ordinals[i]];
+                if (f <= rva && f > bestRva) {
+                    bestRva = f;
+                    best = std::format("{}+{:x}", reinterpret_cast<const char*>(base + names[i]), rva - f);
+                }
+            }
+            // Far from any export: an internal function; group by 4 KB page instead.
+            if (rva - bestRva > 0x2000) best = std::format("+{:x}xxx", rva >> 12);
+        }
+        return {module, best};
+    }
+    void run() {
+        HANDLE target = nullptr;
+        for (int tries = 0; !target && tries < 200 && !stop_; ++tries) {
+            for (const auto& [tid, tc] : threadCpuSnapshot())
+                if (tc.name == name_)
+                    target = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+            if (!target) Sleep(10);
+        }
+        if (!target) return;
+        qos::setThreadName(L"profiler");
+        // Spin for a random 0.2-0.8 ms between samples: a timer would wake together with the
+        // target's own timer and only ever catch it waking up.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        uint64_t rng = 0x9E3779B97F4A7C15ull ^ __rdtsc();
+        while (!stop_ && count_ < rips_.size()) {
+            rng ^= rng << 13, rng ^= rng >> 7, rng ^= rng << 17;
+            const int64_t until = clock::now100ns() + 2000 + static_cast<int64_t>(rng % 6000);
+            while (clock::now100ns() < until) YieldProcessor();
+            if (SuspendThread(target) == static_cast<DWORD>(-1)) break;
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_CONTROL;
+            const bool got = GetThreadContext(target, &ctx);
+            ResumeThread(target);
+            ++taken_;
+            if (got) rips_[count_++] = ctx.Rip;
+        }
+        CloseHandle(target);
+    }
+
+    std::wstring name_;
+    std::thread thread_;
+    std::atomic<bool> stop_{false};
+    std::array<uint64_t, 200000> rips_{};
+    size_t count_ = 0;
+    size_t taken_ = 0;
+};
 
 // Cycle counter rate, measured against QPC (cycle counts are exact; GetThreadTimes is 15.6 ms granular).
 double cyclesPerSecond() {
@@ -511,14 +686,25 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
     if (o.amdCapture) cfg.settings.capture.method = CaptureMethod::AmdDirect;
     cfg.settings.replay.seconds = o.replaySeconds;
     if (!o.outDir.empty()) cfg.settings.output.folder = narrow(o.outDir);
+    if (o.noAudio || o.micOnly) cfg.settings.audio.captureSystem = false;
+    if (o.micOnly) cfg.settings.audio.captureMic = true;
 
     CaptureSession session(cfg);
-    const uint64_t cpu0 = processCycles();
     const double hz = cyclesPerSecond();
     const int64_t t0 = clock::now100ns();
     if (!session.start()) {
         std::println("error: session failed to start (see log)");
         return 1;
+    }
+    // Steady state only: thread start-up and encoder init are left out.
+    Sleep(1000);
+    const uint64_t cpu0 = processCycles();
+    const int64_t steady0 = clock::now100ns();
+    const auto threads0 = threadCpuSnapshot();
+    std::unique_ptr<ThreadSampler> sampler;
+    if (!o.profileThread.empty()) {
+        sampler = std::make_unique<ThreadSampler>(o.profileThread);
+        sampler->start();
     }
     std::optional<SaveResult> recording;
     if (o.recordSeconds > 0) {
@@ -541,7 +727,10 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
     const double remaining = o.seconds - clock::toSeconds(clock::now100ns() - t0);
     if (remaining > 0) Sleep(static_cast<DWORD>(remaining * 1000));
     const double wall = clock::toSeconds(clock::now100ns() - t0);
+    const double steadyWall = clock::toSeconds(clock::now100ns() - steady0);
     const double cpu = (processCycles() - cpu0) / hz;
+    const auto threads1 = threadCpuSnapshot();
+    if (sampler) sampler->stop();
 
     ClipSaver saver(window, kSaved);
     const int64_t saveStart = clock::now100ns();
@@ -573,7 +762,10 @@ int runSessionBench(const BenchOptions& o, HMONITOR monitor) {
     GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
     std::println("process memory:       {:.1f} MB working set, {:.1f} MB private", pmc.WorkingSetSize / 1048576.0,
                  pmc.PrivateUsage / 1048576.0);
-    std::println("CPU (whole process):  {:.2f}% of one core", 100 * cpu / wall);
+    std::println("CPU (whole process):  {:.2f}% of one core (steady state, last {:.1f} s)", 100 * cpu / steadyWall,
+                 steadyWall);
+    printThreadCpu(threads0, threads1, hz, steadyWall);
+    if (sampler) sampler->print();
     if (recording) {
         if (recording->ok) {
             std::println("recording:            {:.2f} s, {:.1f} MB{}{}", recording->seconds,
