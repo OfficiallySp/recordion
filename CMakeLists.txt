@@ -14,6 +14,7 @@ find_package(wil CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(VPL CONFIG REQUIRED)
+find_package(fdk-aac CONFIG REQUIRED)
 find_package(doctest CONFIG REQUIRED)
 
 # Shared compile/link options for everything we build.
@@ -90,8 +91,8 @@ target_compile_definitions(recordion_core PUBLIC ONEVPL_EXPERIMENTAL)
 target_include_directories(recordion_core PUBLIC src PRIVATE ${SHADER_OUT})
 target_link_libraries(recordion_core
     PUBLIC recordion_options WIL::WIL amf_headers nvenc_headers VPL::dispatcher
-    PRIVATE nlohmann_json::nlohmann_json
-    PUBLIC d3d11 dxgi avrt shell32 ole32 windowsapp mfplat mfuuid wmcodecdspuuid mmdevapi dwmapi pdh version)
+    PRIVATE nlohmann_json::nlohmann_json FDK-AAC::fdk-aac
+    PUBLIC d3d11 dxgi avrt shell32 ole32 windowsapp mmdevapi dwmapi pdh version)
 
 # Version.h: the single place the version comes from (About page, file properties).
 configure_file(src/app/Version.h.in ${CMAKE_BINARY_DIR}/generated/Version.h @ONLY)

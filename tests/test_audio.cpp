@@ -88,7 +88,6 @@ long decodedOnset(const std::vector<std::vector<uint8_t>>& frames, const std::ve
 } // namespace
 
 TEST_CASE("AAC encoder produces 1024-sample frames and an AudioSpecificConfig") {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED); // MF needs COM; already-initialised is fine
     rec::AacEncoder enc;
     REQUIRE(enc.init(192));
     CHECK(enc.bitrate() == 192000);
@@ -119,10 +118,10 @@ TEST_CASE("AAC encoder produces 1024-sample frames and an AudioSpecificConfig") 
 #if defined(RECORDION_FFMPEG)
     // Without an edit list, the onset appears late by exactly the encoder delay...
     const long raw = decodedOnset(frames, enc.audioSpecificConfig(), 0);
-    MESSAGE("decoded onset without edit list: ", raw, " (input ", kOnset, ")");
-    CHECK(std::abs(raw - static_cast<long>(kOnset + rec::AacEncoder::kPrimingSamples)) <= 16);
+    MESSAGE("decoded onset without edit list: ", raw, " (input ", kOnset, ", priming ", enc.primingSamples(), ")");
+    CHECK(std::abs(raw - static_cast<long>(kOnset + enc.primingSamples())) <= 16);
     // ...and with the priming in the edit list, it lands on the input sample.
-    const long corrected = decodedOnset(frames, enc.audioSpecificConfig(), rec::AacEncoder::kPrimingSamples);
+    const long corrected = decodedOnset(frames, enc.audioSpecificConfig(), enc.primingSamples());
     CHECK(std::abs(corrected - static_cast<long>(kOnset)) <= 16);
 #endif
 }

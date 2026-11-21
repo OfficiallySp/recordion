@@ -2,165 +2,101 @@
 
 #include "core/Log.h"
 
-#include <mfapi.h>
-#include <mferror.h>
-#include <wmcodecdsp.h>
+#include <fdk-aac/aacenc_lib.h>
 
 #include <algorithm>
-#include <cstring>
+#include <utility>
 
 namespace rec {
-namespace {
-
-LONGLONG samplesTo100ns(uint64_t samples) { return static_cast<LONGLONG>(samples * 10'000'000 / AacEncoder::kSampleRate); }
-
-// True if nothing but our own reference holds `p` (null counts as "no").
-bool soleOwner(::IUnknown* p) {
-    if (!p) return false;
-    p->AddRef();
-    return p->Release() == 1;
-}
-
-} // namespace
 
 AacEncoder::~AacEncoder() {
-    inSample_ = nullptr;
-    inBuffer_ = nullptr;
-    outSample_ = nullptr;
-    outBuffer_ = nullptr;
-    mft_ = nullptr;
-    if (mfStarted_) MFShutdown();
+    if (enc_) aacEncClose(&enc_);
 }
 
 bool AacEncoder::init(uint32_t kbps) {
-    // The Windows AAC encoder accepts exactly these average bitrates.
     static constexpr uint32_t kAllowed[] = {96, 128, 160, 192};
     kbps_ = *std::ranges::min_element(kAllowed, {}, [&](uint32_t a) { return a > kbps ? a - kbps : kbps - a; });
 
-    if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) return false;
-    mfStarted_ = true;
-    if (FAILED(CoCreateInstance(CLSID_AACMFTEncoder, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(mft_.put())))) {
-        log::error("aac: Windows AAC encoder not available");
+    if (aacEncOpen(&enc_, 0x01 /* AAC core only */, kChannels) != AACENC_OK) {
+        enc_ = nullptr;
+        log::error("aac: could not open the encoder");
         return false;
     }
-
-    winrt::com_ptr<IMFMediaType> in;
-    MFCreateMediaType(in.put());
-    in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    in->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-    in->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    in->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kSampleRate);
-    in->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kChannels);
-    in->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, kChannels * 2);
-    in->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, kSampleRate * kChannels * 2);
-    if (FAILED(mft_->SetInputType(0, in.get(), 0))) {
-        log::error("aac: input type rejected");
+    // Constant bitrate, no afterburner: the afterburner costs more CPU than the whole Windows encoder
+    // did, which is what this encoder replaced.
+    const std::pair<AACENC_PARAM, UINT> params[] = {
+        {AACENC_AOT, AOT_AAC_LC},
+        {AACENC_SAMPLERATE, kSampleRate},
+        {AACENC_CHANNELMODE, MODE_2},
+        {AACENC_CHANNELORDER, 1}, // WAV order (L, R)
+        {AACENC_BITRATEMODE, 0},
+        {AACENC_BITRATE, kbps_ * 1000},
+        {AACENC_TRANSMUX, TT_MP4_RAW},
+        {AACENC_AFTERBURNER, 0},
+    };
+    for (const auto& [param, value] : params) {
+        if (aacEncoder_SetParam(enc_, param, value) != AACENC_OK) {
+            log::error("aac: parameter 0x{:X} = {} rejected", static_cast<uint32_t>(param), value);
+            return false;
+        }
+    }
+    AACENC_InfoStruct info{};
+    if (aacEncEncode(enc_, nullptr, nullptr, nullptr, nullptr) != AACENC_OK || aacEncInfo(enc_, &info) != AACENC_OK ||
+        info.frameLength != kFrameSamples) {
+        log::error("aac: encoder initialisation failed");
         return false;
     }
-
-    winrt::com_ptr<IMFMediaType> out;
-    MFCreateMediaType(out.put());
-    out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    out->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-    out->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    out->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kSampleRate);
-    out->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kChannels);
-    out->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, kbps_ * 1000 / 8);
-    out->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);                    // raw frames, no ADTS headers
-    out->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29); // AAC-LC
-    if (FAILED(mft_->SetOutputType(0, out.get(), 0))) {
-        log::error("aac: output type rejected");
-        return false;
-    }
-
-    // MF_MT_USER_DATA is the HEAACWAVEINFO tail (12 bytes) followed by the AudioSpecificConfig.
-    winrt::com_ptr<IMFMediaType> current;
-    UINT8* blob = nullptr;
-    UINT32 blobSize = 0;
-    if (SUCCEEDED(mft_->GetOutputCurrentType(0, current.put())) &&
-        SUCCEEDED(current->GetAllocatedBlob(MF_MT_USER_DATA, &blob, &blobSize))) {
-        if (blobSize > 12) asc_.assign(blob + 12, blob + blobSize);
-        CoTaskMemFree(blob);
-    }
-    if (asc_.empty()) asc_ = {0x11, 0x90}; // AAC-LC, 48 kHz, stereo
-
-    MFT_OUTPUT_STREAM_INFO info{};
-    mft_->GetOutputStreamInfo(0, &info);
-    outputBufferSize_ = std::max<uint32_t>(info.cbSize, 8192);
-    mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    asc_.assign(info.confBuf, info.confBuf + info.confSize);
+    priming_ = info.nDelay;
+    // Largest AAC frame: 6144 bits per channel.
+    out_.resize(std::max<size_t>(info.maxOutBufBytes, 768 * kChannels));
     return true;
 }
 
 bool AacEncoder::encode(std::span<const int16_t> pcm, const FrameCallback& onFrame) {
-    if (!mft_ || pcm.empty()) return mft_ != nullptr;
-    const DWORD bytes = static_cast<DWORD>(pcm.size_bytes());
-    // Reuse the input sample once the encoder has let go of it (it normally copies the PCM).
-    if (!soleOwner(inSample_.get()) || !soleOwner(inBuffer_.get()) || inCapacity_ < bytes) {
-        inSample_ = nullptr;
-        inBuffer_ = nullptr;
-        if (FAILED(MFCreateMemoryBuffer(bytes, inBuffer_.put())) || FAILED(MFCreateSample(inSample_.put())) ||
-            FAILED(inSample_->AddBuffer(inBuffer_.get())))
-            return false;
-        inCapacity_ = bytes;
-    }
-    BYTE* dst = nullptr;
-    if (FAILED(inBuffer_->Lock(&dst, nullptr, nullptr))) return false;
-    std::memcpy(dst, pcm.data(), bytes);
-    inBuffer_->Unlock();
-    inBuffer_->SetCurrentLength(bytes);
-    IMFSample* sample = inSample_.get();
-    const uint64_t frames = pcm.size() / kChannels;
-    sample->SetSampleTime(samplesTo100ns(inputSamples_));
-    sample->SetSampleDuration(samplesTo100ns(inputSamples_ + frames) - samplesTo100ns(inputSamples_));
-    inputSamples_ += frames;
-
-    HRESULT hr = mft_->ProcessInput(0, sample, 0);
-    if (hr == MF_E_NOTACCEPTING) {
-        if (!pull(onFrame)) return false;
-        hr = mft_->ProcessInput(0, sample, 0);
-    }
-    if (FAILED(hr)) {
-        log::error("aac: ProcessInput failed (0x{:08X})", static_cast<uint32_t>(hr));
-        return false;
-    }
-    return pull(onFrame);
-}
-
-bool AacEncoder::pull(const FrameCallback& onFrame) {
-    // One output sample, reused: the encoder only writes into it (it doesn't provide samples).
-    if (!outSample_) {
-        if (FAILED(MFCreateMemoryBuffer(outputBufferSize_, outBuffer_.put())) || FAILED(MFCreateSample(outSample_.put())) ||
-            FAILED(outSample_->AddBuffer(outBuffer_.get()))) {
-            outSample_ = nullptr;
-            outBuffer_ = nullptr;
+    if (!enc_) return false;
+    // The encoder takes what it needs to fill one frame per call and reports how much it consumed.
+    while (!pcm.empty()) {
+        void* inPtr = const_cast<int16_t*>(pcm.data());
+        INT inId = IN_AUDIO_DATA, inSize = static_cast<INT>(pcm.size_bytes()), inElSize = sizeof(int16_t);
+        void* outPtr = out_.data();
+        INT outId = OUT_BITSTREAM_DATA, outSize = static_cast<INT>(out_.size()), outElSize = 1;
+        AACENC_BufDesc in{1, &inPtr, &inId, &inSize, &inElSize};
+        AACENC_BufDesc out{1, &outPtr, &outId, &outSize, &outElSize};
+        AACENC_InArgs inArgs{};
+        inArgs.numInSamples = static_cast<INT>(pcm.size());
+        AACENC_OutArgs outArgs{};
+        if (const AACENC_ERROR e = aacEncEncode(enc_, &in, &out, &inArgs, &outArgs); e != AACENC_OK) {
+            log::error("aac: encode failed (0x{:04X})", static_cast<uint32_t>(e));
             return false;
         }
+        if (outArgs.numOutBytes > 0) onFrame({out_.data(), static_cast<size_t>(outArgs.numOutBytes)}, framesOut_++);
+        if (outArgs.numInSamples <= 0 && outArgs.numOutBytes <= 0) break; // shouldn't happen; don't spin
+        pcm = pcm.subspan(std::min(pcm.size(), static_cast<size_t>(outArgs.numInSamples)));
     }
-    for (;;) {
-        outBuffer_->SetCurrentLength(0);
-        MFT_OUTPUT_DATA_BUFFER out{0, outSample_.get(), 0, nullptr};
-        DWORD status = 0;
-        const HRESULT hr = mft_->ProcessOutput(0, 1, &out, &status);
-        if (out.pEvents) out.pEvents->Release();
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return true;
-        if (FAILED(hr)) {
-            log::error("aac: ProcessOutput failed (0x{:08X})", static_cast<uint32_t>(hr));
-            return false;
-        }
-        BYTE* data = nullptr;
-        DWORD length = 0;
-        outBuffer_->Lock(&data, nullptr, &length);
-        if (length) onFrame({data, length}, framesOut_++);
-        outBuffer_->Unlock();
-    }
+    return true;
 }
 
 bool AacEncoder::drain(const FrameCallback& onFrame) {
-    if (!mft_) return false;
-    mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-    mft_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-    return pull(onFrame);
+    if (!enc_) return false;
+    // numInSamples = -1 flushes the delay line, one frame per call, until the encoder reports EOF.
+    for (int guard = 0; guard < 16; ++guard) {
+        void* outPtr = out_.data();
+        INT outId = OUT_BITSTREAM_DATA, outSize = static_cast<INT>(out_.size()), outElSize = 1;
+        AACENC_BufDesc in{};
+        AACENC_BufDesc out{1, &outPtr, &outId, &outSize, &outElSize};
+        AACENC_InArgs inArgs{};
+        inArgs.numInSamples = -1;
+        AACENC_OutArgs outArgs{};
+        const AACENC_ERROR e = aacEncEncode(enc_, &in, &out, &inArgs, &outArgs);
+        if (outArgs.numOutBytes > 0) onFrame({out_.data(), static_cast<size_t>(outArgs.numOutBytes)}, framesOut_++);
+        if (e == AACENC_ENCODE_EOF) return true;
+        if (e != AACENC_OK) {
+            log::error("aac: flush failed (0x{:04X})", static_cast<uint32_t>(e));
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace rec

@@ -192,8 +192,8 @@ void AudioPipeline::run() {
 
 void AudioPipeline::emit(size_t trackIndex, uint64_t frameIndex, std::span<const uint8_t> frame) {
     // Frame k decodes to the input that started at sample firstFrame + k * 1024 - priming.
-    const int64_t sample = tracks_[trackIndex]->firstFrame + static_cast<int64_t>(frameIndex) * kFrame -
-                           AacEncoder::kPrimingSamples;
+    const Track& t = *tracks_[trackIndex];
+    const int64_t sample = t.firstFrame + static_cast<int64_t>(frameIndex) * kFrame - t.encoder.primingSamples();
     onPacket_(static_cast<uint8_t>(trackIndex + 1), timeline_.toTime(sample), frame);
 }
 

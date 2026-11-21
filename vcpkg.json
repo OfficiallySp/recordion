@@ -11,6 +11,7 @@
       "features": [ "dx11-binding", "win32-binding" ]
     },
     "libvpl",
+    "fdk-aac",
     "doctest"
   ]
 }
